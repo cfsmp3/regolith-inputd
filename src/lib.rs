@@ -4,6 +4,7 @@ mod input_sources;
 mod keyboard;
 mod mouse;
 mod shortcuts;
+pub mod source_switching;
 mod touchpad;
 mod traits;
 mod utils;
