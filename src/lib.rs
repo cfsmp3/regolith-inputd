@@ -10,7 +10,7 @@ use cursor::CursorHandler;
 use input_sources::InputSourcesHandler;
 use keyboard::KeyboardHandler;
 use log::info;
-use log::{debug, warn};
+use log::{debug, error, warn};
 use mouse::MouseHandler;
 use serde::Deserialize;
 use std::error::Error;
@@ -117,9 +117,10 @@ impl SettingsManager {
                                 .lock()
                                 .expect("Acquired lock for handers_sref");
                             for handle in handlers_lock.iter_mut() {
-                                handle
-                                    .apply_all_sync()
-                                    .expect("Failed to re-apply configs from gsettings");
+                                // One failing handler must not end reload handling.
+                                if let Err(e) = handle.apply_all_sync() {
+                                    error!("Failed to re-apply configs from gsettings: {e}");
+                                }
                             }
                         }
                         Err(e) => debug!("Invalid Payload Recieved: {e}"),
