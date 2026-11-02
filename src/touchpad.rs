@@ -1,4 +1,5 @@
 use crate::traits::{InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeToPrimitive};
+use crate::utils;
 use gio::{prelude::SettingsExtManual, traits::SettingsExt, Settings};
 use log::info;
 
@@ -27,7 +28,8 @@ impl TouchpadHandler {
     }
     /// Remember the click method of touchpads not seen before.
     fn remember_default_click_methods(&mut self) -> Result<(), Box<dyn Error>> {
-        for input in self.sway_connection.get_inputs()? {
+        // Devices without vendor/product ids aren't libinput touchpads.
+        for input in utils::get_inputs()? {
             if input.input_type != "touchpad" {
                 continue;
             }
