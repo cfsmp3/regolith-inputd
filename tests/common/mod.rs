@@ -165,10 +165,19 @@ impl Daemon {
             .env("SWAYSOCK", &socket)
             .env("GSETTINGS_BACKEND", "keyfile")
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("IBUS_COMPONENT_PATH", dir.join("ibus"))
             .env("RUST_LOG", "info")
             .spawn()
             .unwrap();
         (sway, Daemon { child, dir })
+    }
+
+    /// Install an IBus component description, as an input method package
+    /// does. The daemon reads them when it applies a list with IBus sources.
+    pub fn install_ibus_component(&self, name: &str, xml: &str) {
+        let dir = self.dir.join("ibus");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{name}.xml")), xml).unwrap();
     }
 
     /// Change a key the way a Settings panel does: through GSettings, here
