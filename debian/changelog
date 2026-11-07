@@ -1,3 +1,22 @@
+regolith-inputd (0.5.0) jammy; urgency=medium
+
+  [ Ken Gilmer ]
+  * fix: link gsettings click-method to sway click_method.  Address https://github.com/regolith-linux/regolith-desktop/issues/1076
+
+  [ rego-port-bot ]
+  * test: run cargo test at package build and add an integration harness
+  * fix: keep running when no input source is set in GNOME
+  * fix: apply the touchpad click method at startup and when it changes
+  * feat: mirror GNOME's XKB options (compose key and others) to sway
+  * feat: mirror GNOME's cursor theme and size to sway
+  * fix: apply keyboard repeat at startup, honour repeat off and the acceleration profile
+  * fix: apply mouse handedness to touchpads that follow the mouse
+  * fix: send sway's name for the touchpad's disabled-on-external-mouse
+  * fix: keep running with input devices that have no vendor or product id
+  * fix: apply input source variants with their layouts, skip unusable sources
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 07 Nov 2026 09:30:11 -0800
+
 regolith-inputd (0.4.1) jammy; urgency=medium
 
   [ Khosrow Moossavi ]
