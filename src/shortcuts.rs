@@ -21,52 +21,111 @@ const CUSTOM_KEYBINDING_SCHEMA: &str =
     "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding";
 const CUSTOM_KEYBINDINGS_KEY: &str = "custom-keybindings";
 
-/// Built-in media-keys entries mirrored to sway, with the `exec` argument each
-/// runs. These are passed to sway as written, so they are already in sway's
-/// syntax.
+/// A built-in media-keys entry mirrored to sway.
+#[derive(Debug, Clone, Copy)]
+struct Builtin {
+    /// The key in the media-keys schema.
+    key: &'static str,
+    /// The `exec` argument. It is passed to sway as written, so it is already
+    /// in sway's syntax.
+    command: &'static str,
+    /// Bound with `--locked`, so that the key also works on the lock screen,
+    /// like the session's own volume and playback bindings.
+    locked: bool,
+}
+
+const fn builtin(key: &'static str, command: &'static str) -> Builtin {
+    Builtin {
+        key,
+        command,
+        locked: false,
+    }
+}
+
+const fn locked(key: &'static str, command: &'static str) -> Builtin {
+    Builtin {
+        key,
+        command,
+        locked: true,
+    }
+}
+
+/// Built-in media-keys entries mirrored to sway, with the command each runs.
 ///
 /// - `www` starts the default web browser, as GNOME does; `x-www-browser` does
 ///   not exist where the browser is a snap.
-/// - `logout` asks for confirmation through the session's own logout prompt
-///   (`$sway.prompt.logout`, the same as the logout keybinding and launcher
-///   entry), which ends gnome-session as well. The `$` is escaped so that
-///   sway expands the variable when the key is pressed, not when it is bound.
+/// - `logout`, `reboot` and `shutdown` ask for confirmation through the
+///   session's own prompts (`$sway.prompt.logout` and the others, the same as
+///   the session keybindings and the launcher entries); logging out ends
+///   gnome-session as well. The `$` is escaped so that sway expands the
+///   variable when the key is pressed, not when it is bound.
+/// - The volume, microphone and playback keys run the same commands as the
+///   session's static bindings for the XF86 keys (`65_media_keybindings` in
+///   regolith-wm-config), with the same volume step: sway expands
+///   `$wm.media.volume.step` when the binding is added.
+/// - `media` starts the default music player, `help` the default help viewer
+///   and `email` the default mail client, as gnome-settings-daemon does.
 ///
 /// The other media-keys entries are not mirrored:
 ///
-/// - Volume, microphone and playback can be rebound in Settings. Their XF86
-///   keys keep working through the session's static bindings, but a
-///   different key chosen in Settings is not bound.
-/// - Stop, eject, the media player, restart, power off, help, email, search
-///   and the accessibility keys can be rebound in Settings too, and have no
-///   binding here yet.
+/// - Eject, search and the accessibility keys can be rebound in Settings,
+///   but do nothing in the sway session yet (search does nothing in the X11
+///   session either: it opens the GNOME Shell search).
 /// - Brightness, the power keys (handled by logind), the touchpad and
-///   rotation keys and the `*-static` variants are not in Settings.
-const BUILTIN_SHORTCUTS: [(&str, &str); 7] = [
-    ("terminal", "x-terminal-emulator"),
-    ("home", "xdg-open $HOME"),
-    ("www", "gtk-launch $(xdg-settings get default-web-browser)"),
-    ("calculator", "gnome-calculator"),
-    ("control-center", "gnome-control-center"),
-    ("screensaver", "loginctl lock-session"),
-    ("logout", r"swaymsg exec \$sway.prompt.logout"),
+///   rotation keys and the `*-static` variants are not in Settings. The
+///   session binds the XF86 media keys statically.
+const BUILTIN_SHORTCUTS: [Builtin; 21] = [
+    builtin("terminal", "x-terminal-emulator"),
+    builtin("home", "xdg-open $HOME"),
+    builtin("www", "gtk-launch $(xdg-settings get default-web-browser)"),
+    builtin("calculator", "gnome-calculator"),
+    builtin("control-center", "gnome-control-center"),
+    builtin("screensaver", "loginctl lock-session"),
+    builtin("logout", r"swaymsg exec \$sway.prompt.logout"),
+    builtin("reboot", r"swaymsg exec \$sway.prompt.reboot"),
+    builtin("shutdown", r"swaymsg exec \$sway.prompt.shutdown"),
+    locked("volume-mute", "volumectl %"),
+    locked("volume-down", "volumectl -u - $wm.media.volume.step"),
+    locked("volume-up", "volumectl -u + $wm.media.volume.step"),
+    locked("mic-mute", "volumectl -m %"),
+    locked("play", "playerctl play-pause"),
+    locked("pause", "playerctl pause"),
+    locked("stop", "playerctl stop"),
+    locked("previous", "playerctl previous"),
+    locked("next", "playerctl next"),
+    builtin(
+        "media",
+        "gtk-launch $(xdg-mime query default audio/x-vorbis+ogg)",
+    ),
+    builtin(
+        "help",
+        "gtk-launch $(xdg-settings get default-url-scheme-handler help)",
+    ),
+    builtin(
+        "email",
+        "gtk-launch $(xdg-settings get default-url-scheme-handler mailto)",
+    ),
 ];
 
-/// A sway key binding: a `+`-separated combo, optionally on key release.
+/// A sway key binding: a `+`-separated combo, optionally on key release or
+/// also while the screen is locked.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Binding {
     combo: String,
     release: bool,
+    locked: bool,
 }
 
 impl fmt::Display for Binding {
     /// Formats the binding as `bindsym`/`unbindsym` arguments.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.release {
-            write!(f, "--release {}", self.combo)
-        } else {
-            f.write_str(&self.combo)
+        if self.locked {
+            f.write_str("--locked ")?;
         }
+        if self.release {
+            f.write_str("--release ")?;
+        }
+        f.write_str(&self.combo)
     }
 }
 
@@ -108,6 +167,7 @@ fn parse_accelerator(accelerator: &str) -> Option<Binding> {
     Some(Binding {
         combo: combo.join("+"),
         release,
+        locked: false,
     })
 }
 
@@ -241,7 +301,7 @@ impl ShortcutsState {
 pub struct ShortcutsHandler {
     settings: Settings,
     /// The entries of `BUILTIN_SHORTCUTS` that the installed schema has.
-    builtin_shortcuts: Vec<(&'static str, &'static str)>,
+    builtin_shortcuts: Vec<Builtin>,
     // Settings callbacks run on the GLib main loop while a sway reload
     // re-applies everything from the event thread.
     state: Mutex<ShortcutsState>,
@@ -259,8 +319,8 @@ impl ShortcutsHandler {
         // a key its schema lacks.
         let (builtin_shortcuts, missing): (Vec<_>, Vec<_>) = BUILTIN_SHORTCUTS
             .into_iter()
-            .partition(|(key, _)| schema.has_key(key));
-        for (key, _) in missing {
+            .partition(|builtin| schema.has_key(builtin.key));
+        for Builtin { key, .. } in missing {
             info!("{MEDIA_KEYS_SCHEMA} has no key {key}, not mirroring it");
         }
         Some(ShortcutsHandler {
@@ -326,12 +386,17 @@ impl ShortcutsHandler {
     /// argument it runs.
     fn wanted_bindings(&self, state: &ShortcutsState) -> BTreeMap<Binding, String> {
         let mut wanted = BTreeMap::new();
-        for &(key, command) in &self.builtin_shortcuts {
+        for &Builtin {
+            key,
+            command,
+            locked,
+        } in &self.builtin_shortcuts
+        {
             let accelerators: Vec<String> = self.settings.get(key);
             for accelerator in accelerators.iter().filter(|a| !a.is_empty()) {
                 match parse_accelerator(accelerator) {
                     Some(binding) => {
-                        wanted.insert(binding, command.to_string());
+                        wanted.insert(Binding { locked, ..binding }, command.to_string());
                     }
                     None => warn!("Ignoring invalid accelerator {accelerator:?} for {key}"),
                 }
@@ -372,7 +437,7 @@ impl InputHandler for ShortcutsHandler {
             .sway_connection
     }
     fn apply_changes(&mut self, key: &str) -> Result<(), Box<dyn Error>> {
-        if key == CUSTOM_KEYBINDINGS_KEY || self.builtin_shortcuts.iter().any(|(k, _)| *k == key) {
+        if key == CUSTOM_KEYBINDINGS_KEY || self.builtin_shortcuts.iter().any(|b| b.key == key) {
             info!("{MEDIA_KEYS_SCHEMA} -> Key: {key} changed");
             self.refresh(false)?;
         }
@@ -421,6 +486,24 @@ mod tests {
             Some("--release Mod4+Delete")
         );
         assert_eq!(binding("<Release>F12").as_deref(), Some("--release F12"));
+    }
+
+    #[test]
+    fn locked_becomes_a_flag() {
+        let locked = |accelerator| {
+            parse_accelerator(accelerator).map(|binding| {
+                Binding {
+                    locked: true,
+                    ..binding
+                }
+                .to_string()
+            })
+        };
+        assert_eq!(locked("<Super>F12").as_deref(), Some("--locked Mod4+F12"));
+        assert_eq!(
+            locked("<Release>F12").as_deref(),
+            Some("--locked --release F12")
+        );
     }
 
     #[test]
