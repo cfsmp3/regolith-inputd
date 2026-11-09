@@ -13,10 +13,12 @@ use swayipc::Connection as SwayConnection;
 /// gives an engine whose description has none.
 const DEFAULT_LAYOUT: &str = "us";
 
-/// A source of the effective source list: the XKB layout and variant it
-/// applies, and for an IBus source its engine.
+/// A source of the effective source list: its identity in the `sources`
+/// setting, the XKB layout and variant it applies, and for an IBus source
+/// its engine.
 #[derive(Clone)]
 pub struct EffectiveSource {
+    pub source: (String, String),
     pub layout: String,
     pub variant: String,
     pub engine: Option<String>,
@@ -36,12 +38,13 @@ pub fn effective_sources(sources: Vec<(String, String)>) -> Vec<EffectiveSource>
                 None => ((id.clone(), String::new()), None),
             },
             "ibus" => match engines.get_or_insert_with(ibus_engines).get(&id) {
-                Some(desc) => (desc.clone(), Some(id)),
+                Some(desc) => (desc.clone(), Some(id.clone())),
                 None => continue,
             },
             _ => continue,
         };
         effective.push(EffectiveSource {
+            source: (kind, id),
             layout,
             variant,
             engine,
