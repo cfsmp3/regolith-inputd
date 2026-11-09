@@ -198,6 +198,9 @@ impl Daemon {
         let socket = dir.join("sway.sock");
         let sway = FakeSway::start(&socket, inputs);
         let child = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"))
+            // Without a Wayland display the daemon starts no input method, so
+            // tests run from a desktop session leave its IBus alone.
+            .env_remove("WAYLAND_DISPLAY")
             .env("SWAYSOCK", &socket)
             .env("GSETTINGS_BACKEND", "keyfile")
             .env("XDG_CONFIG_HOME", dir.join("config"))

@@ -1,3 +1,4 @@
+use crate::input_method::InputMethod;
 use crate::InputHandler;
 use gio::{prelude::SettingsExtManual, Settings};
 use log::{info, warn};
@@ -13,10 +14,12 @@ use swayipc::Connection as SwayConnection;
 const DEFAULT_LAYOUT: &str = "us";
 
 /// A source of the effective source list: the XKB layout and variant it
-/// applies.
+/// applies, and for an IBus source its engine.
+#[derive(Clone)]
 pub struct EffectiveSource {
     pub layout: String,
     pub variant: String,
+    pub engine: Option<String>,
 }
 
 /// The sources in effect, in list order, as in GNOME Shell: an xkb source
@@ -27,18 +30,22 @@ pub fn effective_sources(sources: Vec<(String, String)>) -> Vec<EffectiveSource>
     let mut engines: Option<HashMap<String, (String, String)>> = None;
     let mut effective = Vec::new();
     for (kind, id) in sources {
-        let (layout, variant) = match kind.as_str() {
+        let ((layout, variant), engine) = match kind.as_str() {
             "xkb" => match id.split_once('+') {
-                Some((layout, variant)) => (layout.to_string(), variant.to_string()),
-                None => (id.clone(), String::new()),
+                Some((layout, variant)) => ((layout.to_string(), variant.to_string()), None),
+                None => ((id.clone(), String::new()), None),
             },
             "ibus" => match engines.get_or_insert_with(ibus_engines).get(&id) {
-                Some(desc) => desc.clone(),
+                Some(desc) => (desc.clone(), Some(id)),
                 None => continue,
             },
             _ => continue,
         };
-        effective.push(EffectiveSource { layout, variant });
+        effective.push(EffectiveSource {
+            layout,
+            variant,
+            engine,
+        });
     }
     effective
 }
@@ -46,7 +53,7 @@ pub fn effective_sources(sources: Vec<(String, String)>) -> Vec<EffectiveSource>
 /// The installed IBus engine descriptions, by engine name: the layout and
 /// variant of each. They are read from IBus's component directories
 /// (`$IBUS_COMPONENT_PATH`, else `/usr/share/ibus/component`).
-fn ibus_engines() -> HashMap<String, (String, String)> {
+pub(crate) fn ibus_engines() -> HashMap<String, (String, String)> {
     let dirs: Vec<PathBuf> = match env::var("IBUS_COMPONENT_PATH") {
         Ok(path) => env::split_paths(&path).collect(),
         Err(_) => vec![PathBuf::from("/usr/share/ibus/component")],
@@ -113,6 +120,7 @@ fn element(xml: &str, tag: &str) -> Option<String> {
 pub struct InputSourcesHandler {
     settings: Settings,
     sway_connection: SwayConnection,
+    input_method: InputMethod,
 }
 impl InputSourcesHandler {
     pub fn new() -> InputSourcesHandler {
@@ -121,12 +129,14 @@ impl InputSourcesHandler {
         InputSourcesHandler {
             settings,
             sway_connection,
+            input_method: InputMethod::start(),
         }
     }
     fn apply_input_sources(&mut self) -> Result<(), Box<dyn Error>> {
         let sources: Vec<(String, String)> = self.settings().get("sources");
         if sources.is_empty() {
             info!("No input sources set in GNOME, keeping sway's keyboard layout");
+            self.input_method.set_sources(Vec::new());
             return Ok(());
         }
         let effective = effective_sources(sources);
@@ -155,6 +165,8 @@ impl InputSourcesHandler {
                 }
             }
         }
+        // The layouts are in: the input method follows the new list.
+        self.input_method.set_sources(effective);
         Ok(())
     }
     /// Apply GNOME's XKB options (compose key, alternate characters key and
