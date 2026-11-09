@@ -5,6 +5,7 @@ use swayipc::Fallible;
 
 /// An input device as sway reports it: identifier, type and libinput
 /// settings.
+#[derive(Clone)]
 struct Device {
     identifier: String,
     input_type: String,
@@ -54,11 +55,12 @@ impl SwayState {
     /// The settings on which all devices of `input_type` that have them
     /// agree. GSettings has one value for all devices of a type, so a
     /// setting that differs between devices has none; a device without a
-    /// setting (an absolute pointer has no acceleration) doesn't count.
+    /// setting (an absolute pointer has no acceleration) doesn't count,
+    /// whether sway leaves the setting out or reports it as null.
     fn common_settings(&self, input_type: &str) -> BTreeMap<&str, &Value> {
         let mut common: BTreeMap<&str, Option<&Value>> = BTreeMap::new();
         for device in self.0.iter().filter(|d| d.input_type == input_type) {
-            for (setting, value) in &device.libinput {
+            for (setting, value) in device.libinput.iter().filter(|(_, v)| !v.is_null()) {
                 common
                     .entry(setting)
                     .and_modify(|agreed| {
@@ -95,6 +97,35 @@ impl SwayState {
             }
         }
         changes
+    }
+
+    /// Take the devices of every type whose devices were added or removed
+    /// between `self` and `new` as they are in `new`.
+    pub fn adopt_devices(&mut self, new: &SwayState) {
+        let types: BTreeSet<String> = self
+            .0
+            .iter()
+            .chain(&new.0)
+            .map(|d| d.input_type.clone())
+            .collect();
+        for input_type in types {
+            if self.identifiers(&input_type) != new.identifiers(&input_type) {
+                self.0.retain(|d| d.input_type != input_type);
+                self.0
+                    .extend(new.0.iter().filter(|d| d.input_type == input_type).cloned());
+            }
+        }
+    }
+
+    /// Whether every device of `input_type` that has `setting` still
+    /// agrees on `value`, with the same devices as in `before`.
+    pub fn still_holds(
+        &self,
+        before: &SwayState,
+        (input_type, setting, value): &(String, String, Value),
+    ) -> bool {
+        self.identifiers(input_type) == before.identifiers(input_type)
+            && self.common_settings(input_type).get(setting.as_str()) == Some(&value)
     }
 }
 
@@ -179,6 +210,27 @@ mod tests {
     }
 
     #[test]
+    fn changes_after_adopting_plugged_in_devices_are_reported() {
+        let one = state(&[device("1:1:A", "pointer", json!({"tap": "disabled"}))]);
+        let two = |second: &str| {
+            state(&[
+                device("1:1:A", "pointer", json!({"tap": "disabled"})),
+                device("2:2:B", "pointer", json!({"tap": second})),
+            ])
+        };
+        let mut known = one;
+        known.adopt_devices(&two("enabled"));
+        assert!(known.changes(&two("enabled")).is_empty());
+        assert_eq!(
+            known.changes(&state(&[
+                device("1:1:A", "pointer", json!({"tap": "enabled"})),
+                device("2:2:B", "pointer", json!({"tap": "enabled"})),
+            ])),
+            [("pointer".to_string(), "tap".to_string(), json!("enabled"))]
+        );
+    }
+
+    #[test]
     fn devices_sharing_an_identifier_are_all_kept() {
         let mouse = |relative: &str, absolute: &str| {
             state(&[
@@ -228,6 +280,28 @@ mod tests {
         assert_eq!(
             pointers(0.0).changes(&pointers(0.5)),
             [("pointer".to_string(), "accel_speed".to_string(), json!(0.5))]
+        );
+    }
+
+    #[test]
+    fn settings_reported_as_null_do_not_count() {
+        let pointers = |speed: f64| {
+            state(&[
+                device("1:1:Mouse", "pointer", json!({"accel_speed": speed})),
+                device(
+                    "2:2:Absolute",
+                    "pointer",
+                    json!({"accel_speed": null, "tap": null}),
+                ),
+            ])
+        };
+        assert_eq!(
+            pointers(0.0).changes(&pointers(0.25)),
+            [(
+                "pointer".to_string(),
+                "accel_speed".to_string(),
+                json!(0.25)
+            )]
         );
     }
 

@@ -109,8 +109,8 @@ impl State {
     }
 
     /// Run the libinput part of an `input` command, as sway does: set the
-    /// setting on every matching device that has it, and report the
-    /// devices it changed.
+    /// setting on every matching device that has it (not on one that
+    /// reports it as null), and report the devices it changed.
     fn run_libinput(&mut self, cmd: &str) {
         let Some(rest) = cmd.strip_prefix("input ") else {
             return;
@@ -137,7 +137,10 @@ impl State {
                 None => input["identifier"] == target.trim_matches('"'),
             };
             let libinput = &mut input["libinput"];
-            if matches && libinput.get(setting).is_some() && libinput[setting] != value {
+            if matches
+                && libinput.get(setting).is_some_and(|v| !v.is_null())
+                && libinput[setting] != value
+            {
                 libinput[setting] = value.clone();
                 changed.push(input.clone());
             }

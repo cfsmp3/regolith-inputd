@@ -48,9 +48,11 @@ pub fn get_inputs() -> Fallible<Vec<Input>> {
 
 /// An event from sway, as far as the daemon cares.
 pub enum SwayEvent {
-    /// An input device was added, removed or configured. What the event
-    /// reports isn't kept: by the time it is read it may be out of date.
+    /// An input device was configured. What the event reports isn't kept:
+    /// by the time it is read it may be out of date.
     Input,
+    /// An input device was added or removed.
+    Hotplug,
     /// A tick sent with `swaymsg -t send_tick`, with its payload.
     Tick(String),
     /// sway loaded its configuration again.
@@ -77,6 +79,9 @@ pub fn subscribe_to_events() -> Fallible<impl Iterator<Item = Fallible<SwayEvent
 fn decode_event(kind: u32, payload: &[u8]) -> SwayEvent {
     let payload: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
     match kind {
+        INPUT_EVENT if payload["change"] == "added" || payload["change"] == "removed" => {
+            SwayEvent::Hotplug
+        }
         INPUT_EVENT => SwayEvent::Input,
         // The tick sent to every new subscriber is no reload.
         TICK_EVENT if payload["first"] == false => match payload["payload"].as_str() {
