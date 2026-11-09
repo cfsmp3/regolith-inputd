@@ -16,6 +16,7 @@ use keyboard::KeyboardHandler;
 use log::{debug, error, info, warn};
 use mouse::MouseHandler;
 use serde::Deserialize;
+use serde_json::Value;
 use shortcuts::ShortcutsHandler;
 use std::error::Error;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -33,6 +34,11 @@ use utils::SwayEvent;
 /// follows it within this time.
 const SETTLE_TIME: Duration = Duration::from_millis(500);
 
+/// sway makes all of a reload's device changes within this time of the
+/// reload's signal, so input events older than this, with no reload signal
+/// since, are no reload's.
+const RELOAD_LEAD: Duration = Duration::from_millis(250);
+
 /// How long to wait for the end of a reload announced by a `reload_pending`
 /// tick. A reload whose configuration fails to load never ends.
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -43,9 +49,10 @@ type Handlers = Vec<Box<dyn InputHandler + Send>>;
 pub(crate) enum Message {
     /// A key of the schema of handler `.0` changed in GSettings.
     GSettingsChanged(usize, String),
-    /// sway sent an input event: a device was added or removed, or its
-    /// configuration changed.
+    /// sway sent an input event about a device's configuration.
     SwayInput,
+    /// sway sent an input event about a device being added or removed.
+    SwayHotplug,
     /// Regolith's reload binding is about to reload sway.
     ReloadPending,
     /// sway has loaded its configuration again: a `reload_done` tick, or
@@ -116,6 +123,7 @@ impl Owner {
             match message {
                 Some(Message::GSettingsChanged(index, key)) => self.apply_change(index, &key),
                 Some(Message::SwayInput) => self.unsettled = Some(Instant::now()),
+                Some(Message::SwayHotplug) => self.hotplugged(),
                 Some(Message::ReloadPending) => self.reloading(false),
                 Some(Message::ReloadDone) => self.reloading(true),
                 None => self.settled(),
@@ -134,13 +142,30 @@ impl Owner {
 
     fn reloading(&mut self, done: bool) {
         info!("Sway reload {}", if done { "done" } else { "pending" });
-        let started = self
-            .reload
-            .as_ref()
-            .map_or_else(Instant::now, |r| r.started);
+        // The wait for a reload runs from its own reload_pending tick.
+        let started = match &self.reload {
+            Some(reload) if done => reload.started,
+            _ => Instant::now(),
+        };
         self.reload = Some(Reload { started, done });
         // Some of the reload's device resets may still be on their way.
         self.unsettled = Some(Instant::now());
+    }
+
+    /// A device was plugged in or out. What it arrived with, or took away,
+    /// is no change a person made: take the devices of the types whose
+    /// devices changed as they are now, so that changes made to them from
+    /// now on are mirrored.
+    fn hotplugged(&mut self) {
+        self.unsettled = Some(Instant::now());
+        // After a reload, sway's whole state is taken anyway.
+        if self.reload.is_some() {
+            return;
+        }
+        match SwayState::read() {
+            Ok(state) => self.known.adopt_devices(&state),
+            Err(e) => warn!("Failed to read sway's input state: {e}"),
+        }
     }
 
     fn settled(&mut self) {
@@ -162,12 +187,39 @@ impl Owner {
     }
 
     fn apply_change(&mut self, index: usize, key: &str) {
+        // A change made in sway that hasn't settled yet, but is too old to
+        // be a reload's, is a person's. Taking sway's state after applying
+        // GSettings would hide it, so note it first.
+        let pending = match (&self.reload, self.unsettled) {
+            (None, Some(last_event)) if last_event.elapsed() >= RELOAD_LEAD => {
+                match SwayState::read() {
+                    Ok(state) => {
+                        let changes = self.known.changes(&state);
+                        Some((state, changes))
+                    }
+                    Err(e) => {
+                        warn!("Failed to read sway's input state: {e}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         if let Err(e) = self.handlers[index].apply_changes(key) {
             error!("{e}");
         }
         // During a reload, everything is applied again once it ends.
         if self.reload.is_none() {
             self.accept_sway_state();
+            // Mirror what the GSettings change left in place: a later
+            // GSettings change to the same setting wins over sway's.
+            if let Some((before, changes)) = pending {
+                let kept: Vec<_> = changes
+                    .into_iter()
+                    .filter(|change| self.known.still_holds(&before, change))
+                    .collect();
+                self.mirror(kept);
+            }
         }
     }
 
@@ -185,7 +237,14 @@ impl Owner {
             Ok(state) => state,
             Err(e) => return warn!("Failed to read sway's input state: {e}"),
         };
-        for (input_type, setting, value) in self.known.changes(&state) {
+        let changes = self.known.changes(&state);
+        self.mirror(changes);
+        self.known = state;
+    }
+
+    /// Write settings sway's devices changed to GSettings.
+    fn mirror(&self, changes: Vec<(String, String, Value)>) {
+        for (input_type, setting, value) in changes {
             let handler = self
                 .handlers
                 .iter()
@@ -197,7 +256,6 @@ impl Owner {
                 }
             }
         }
-        self.known = state;
     }
 }
 
@@ -242,6 +300,7 @@ impl SettingsManager {
         for event in events {
             let message = match event {
                 Ok(SwayEvent::Input) => Message::SwayInput,
+                Ok(SwayEvent::Hotplug) => Message::SwayHotplug,
                 Ok(SwayEvent::WorkspaceReload) => Message::ReloadDone,
                 Ok(SwayEvent::Tick(payload)) => {
                     use SwayReloadStatus::{ReloadDone, ReloadPending};
