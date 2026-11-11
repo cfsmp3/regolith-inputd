@@ -335,30 +335,87 @@ fn a_bare_reload_keeps_gsettings() {
     );
 }
 
-/// A device that lacks a setting can report it as null, as an absolute
-/// pointer does for its acceleration. It takes no part in the agreement,
-/// so a speed change to the other pointers is still mirrored.
+/// sway lists only the settings a device supports: VMware's mouse has an
+/// absolute node, without acceleration, next to its relative one, under
+/// the same identifier. The absolute node takes no part in the speed
+/// agreement, and keeps taking part in the others.
 #[test]
-fn a_setting_reported_as_null_does_not_block_mirroring() {
+fn a_device_without_a_setting_does_not_block_mirroring() {
+    const VMMOUSE: &str = "2:19:VirtualPS/2_VMware_VMMouse";
     let mut inputs: serde_json::Value = serde_json::from_str(INPUTS).unwrap();
-    inputs.as_array_mut().unwrap().push(json!({
-        "identifier": "1:3:QEMU_QEMU_USB_Tablet", "name": "QEMU QEMU USB Tablet",
-        "vendor": 1, "product": 3, "type": "pointer",
-        "libinput": {"send_events": "enabled", "accel_speed": null,
-                     "natural_scroll": "disabled", "left_handed": "disabled"}}));
+    for libinput in [
+        json!({"send_events": "enabled", "natural_scroll": "disabled",
+               "left_handed": "disabled", "middle_emulation": "disabled"}),
+        json!({"send_events": "enabled", "accel_speed": 0.0, "accel_profile": "adaptive",
+               "natural_scroll": "disabled", "left_handed": "disabled",
+               "scroll_method": "none"}),
+    ] {
+        inputs.as_array_mut().unwrap().push(json!({
+            "identifier": VMMOUSE, "name": "VirtualPS/2 VMware VMMouse",
+            "vendor": 2, "product": 19, "type": "pointer", "libinput": libinput}));
+    }
     // The harness keeps the devices for the whole test.
     let inputs: &'static str = Box::leak(inputs.to_string().into_boxed_str());
-    let (sway, daemon) = Daemon::start_with_inputs("sway-null", KEYFILE, inputs);
+    let (sway, daemon) = Daemon::start_with_inputs("sway-absent", KEYFILE, inputs);
     sway.wait_for_startup();
     let monitor = daemon.monitor(MOUSE);
     sway.user_command("input type:pointer pointer_accel 0.25");
     assert_eq!(daemon.wait_for_gsetting(MOUSE, "speed", "0.25"), "0.25");
-    settle();
-    assert_eq!(monitor.changes(), ["speed: 0.25"]);
+    sway.user_command("input type:pointer natural_scroll enabled");
     assert_eq!(
-        sway.libinput("1:3:QEMU_QEMU_USB_Tablet", "accel_speed"),
-        serde_json::Value::Null
+        daemon.wait_for_gsetting(MOUSE, "natural-scroll", "true"),
+        "true"
     );
+    settle();
+    assert_eq!(monitor.changes(), ["speed: 0.25", "natural-scroll: true"]);
+}
+
+/// Several changes in a row, as a swaymsg command list makes them, are
+/// mirrored as the value they end on, once; changes that end where they
+/// started are not written at all.
+#[test]
+fn a_burst_of_changes_is_mirrored_as_its_final_value() {
+    let (sway, daemon) = Daemon::start_with_inputs("sway-burst", KEYFILE, INPUTS);
+    sway.wait_for_startup();
+    let touchpad = daemon.monitor(TOUCHPAD);
+    sway.user_command("input type:touchpad tap enabled");
+    sway.user_command("input type:touchpad tap disabled");
+    settle();
+    assert_eq!(touchpad.changes(), Vec::<String>::new());
+    for value in ["enabled", "disabled", "enabled"] {
+        sway.user_command(&format!("input type:touchpad tap {value}"));
+    }
+    for speed in ["0.5", "-0.25", "0.75"] {
+        sway.user_command(&format!("input type:touchpad pointer_accel {speed}"));
+    }
+    settle();
+    assert_eq!(touchpad.changes(), ["speed: 0.75", "tap-to-click: true"]);
+}
+
+/// With two touchpads, a change to one of them stays that device's: there
+/// is no one value for GSettings. Once both agree, it is mirrored.
+#[test]
+fn a_change_to_one_of_two_touchpads_waits_for_agreement() {
+    const SECOND: &str = "1739:52710:SYNA_Touchpad";
+    let (sway, daemon) = Daemon::start_with_inputs("sway-two-pads", KEYFILE, INPUTS);
+    sway.wait_for_startup();
+    let mut second: serde_json::Value = serde_json::from_str(INPUTS).unwrap();
+    let mut second = second[1].take();
+    second["identifier"] = json!(SECOND);
+    sway.add_device(second);
+    settle();
+    let touchpad = daemon.monitor(TOUCHPAD);
+    sway.user_command(&format!("input \"{PAD}\" tap enabled"));
+    settle();
+    assert_eq!(touchpad.changes(), Vec::<String>::new());
+    assert_eq!(sway.libinput(SECOND, "tap"), "disabled");
+    sway.user_command(&format!("input \"{SECOND}\" tap enabled"));
+    assert_eq!(
+        daemon.wait_for_gsetting(TOUCHPAD, "tap-to-click", "true"),
+        "true"
+    );
+    settle();
+    assert_eq!(touchpad.changes(), ["tap-to-click: true"]);
 }
 
 /// A change made right after a device is plugged in, before sway's devices

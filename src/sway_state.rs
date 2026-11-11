@@ -12,6 +12,17 @@ struct Device {
     libinput: Map<String, Value>,
 }
 
+/// A libinput setting that every device of a type now agrees on, and that
+/// differs from what they agreed on before.
+#[derive(Debug, PartialEq)]
+pub struct Change {
+    /// The devices' type, as sway reports it ("pointer", "touchpad").
+    pub input_type: String,
+    /// The setting, named as in sway's GET_INPUTS reply ("accel_speed").
+    pub setting: String,
+    pub value: Value,
+}
+
 /// The libinput settings of sway's input devices. Several devices can
 /// share an identifier (a mouse with a relative and an absolute node, a
 /// receiver for several devices), so they are kept in a list.
@@ -54,9 +65,10 @@ impl SwayState {
 
     /// The settings on which all devices of `input_type` that have them
     /// agree. GSettings has one value for all devices of a type, so a
-    /// setting that differs between devices has none; a device without a
-    /// setting (an absolute pointer has no acceleration) doesn't count,
-    /// whether sway leaves the setting out or reports it as null.
+    /// setting that differs between devices has none. sway leaves out the
+    /// settings a device lacks (an absolute pointer has no acceleration, a
+    /// touchpad without tapping has no tap settings), so such a device
+    /// doesn't count; a null is read the same way.
     fn common_settings(&self, input_type: &str) -> BTreeMap<&str, &Value> {
         let mut common: BTreeMap<&str, Option<&Value>> = BTreeMap::new();
         for device in self.0.iter().filter(|d| d.input_type == input_type) {
@@ -82,7 +94,7 @@ impl SwayState {
     /// type:...` or by configuring their only device. Types whose devices
     /// were added or removed in between are left out, since a device that
     /// was just plugged in is no change the user made.
-    pub fn changes(&self, new: &SwayState) -> Vec<(String, String, Value)> {
+    pub fn changes(&self, new: &SwayState) -> Vec<Change> {
         let types: BTreeSet<&str> = new.0.iter().map(|d| d.input_type.as_str()).collect();
         let mut changes = Vec::new();
         for input_type in types {
@@ -92,7 +104,11 @@ impl SwayState {
             let old = self.common_settings(input_type);
             for (setting, value) in new.common_settings(input_type) {
                 if old.get(setting) != Some(&value) {
-                    changes.push((input_type.to_string(), setting.to_string(), value.clone()));
+                    changes.push(Change {
+                        input_type: input_type.to_string(),
+                        setting: setting.to_string(),
+                        value: value.clone(),
+                    });
                 }
             }
         }
@@ -117,21 +133,21 @@ impl SwayState {
         }
     }
 
-    /// Whether every device of `input_type` that has `setting` still
-    /// agrees on `value`, with the same devices as in `before`.
-    pub fn still_holds(
-        &self,
-        before: &SwayState,
-        (input_type, setting, value): &(String, String, Value),
-    ) -> bool {
+    /// Whether the devices of the change's type, the same ones as in
+    /// `before`, still agree on its value.
+    pub fn still_holds(&self, before: &SwayState, change: &Change) -> bool {
+        let input_type = change.input_type.as_str();
         self.identifiers(input_type) == before.identifiers(input_type)
-            && self.common_settings(input_type).get(setting.as_str()) == Some(&value)
+            && self
+                .common_settings(input_type)
+                .get(change.setting.as_str())
+                == Some(&&change.value)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SwayState;
+    use super::{Change, SwayState};
     use serde_json::{json, Value};
 
     fn device(identifier: &str, input_type: &str, libinput: Value) -> Value {
@@ -140,6 +156,14 @@ mod tests {
 
     fn state(devices: &[Value]) -> SwayState {
         SwayState::from_inputs(devices.to_vec())
+    }
+
+    fn change(input_type: &str, setting: &str, value: Value) -> Change {
+        Change {
+            input_type: input_type.to_string(),
+            setting: setting.to_string(),
+            value,
+        }
     }
 
     #[test]
@@ -170,7 +194,7 @@ mod tests {
         ]);
         assert_eq!(
             old.changes(&new),
-            [("touchpad".to_string(), "tap".to_string(), json!("enabled"))]
+            [change("touchpad", "tap", json!("enabled"))]
         );
         assert!(new.changes(&new).is_empty());
     }
@@ -187,11 +211,32 @@ mod tests {
         // When the devices agree again, their common value is reported.
         assert_eq!(
             mice("enabled").changes(&mice("disabled")),
-            [(
-                "pointer".to_string(),
-                "left_handed".to_string(),
-                json!("disabled")
-            )]
+            [change("pointer", "left_handed", json!("disabled"))]
+        );
+    }
+
+    /// Agreement is per type and per setting: two touchpads that disagree on
+    /// tapping still have a common speed, and a mouse is no touchpad.
+    #[test]
+    fn agreement_is_per_type_and_setting() {
+        let devices = |second_tap: &str, speed: f64| {
+            state(&[
+                device(
+                    "1:1:Pad",
+                    "touchpad",
+                    json!({"tap": "enabled", "accel_speed": speed}),
+                ),
+                device(
+                    "2:2:Pad",
+                    "touchpad",
+                    json!({"tap": second_tap, "accel_speed": speed}),
+                ),
+                device("3:3:Mouse", "pointer", json!({"accel_speed": 0.0})),
+            ])
+        };
+        assert_eq!(
+            devices("disabled", 0.0).changes(&devices("disabled", 0.5)),
+            [change("touchpad", "accel_speed", json!(0.5))]
         );
     }
 
@@ -226,7 +271,7 @@ mod tests {
                 device("1:1:A", "pointer", json!({"tap": "enabled"})),
                 device("2:2:B", "pointer", json!({"tap": "enabled"})),
             ])),
-            [("pointer".to_string(), "tap".to_string(), json!("enabled"))]
+            [change("pointer", "tap", json!("enabled"))]
         );
     }
 
@@ -256,53 +301,62 @@ mod tests {
             .is_empty());
         assert_eq!(
             mouse("disabled", "disabled").changes(&mouse("enabled", "enabled")),
-            [(
-                "pointer".to_string(),
-                "natural_scroll".to_string(),
-                json!("enabled")
-            )]
+            [change("pointer", "natural_scroll", json!("enabled"))]
         );
         assert!(mouse("disabled", "disabled").changes(&one_node).is_empty());
     }
 
+    /// sway 1.11 leaves out what a device can't do: VMware's absolute mouse
+    /// node has no `accel_speed`, while its relative node, with the same
+    /// identifier, has one.
     #[test]
     fn devices_without_a_setting_do_not_count() {
         let pointers = |speed: f64| {
             state(&[
-                device("1:1:Mouse", "pointer", json!({"accel_speed": speed})),
                 device(
-                    "2:2:Absolute",
+                    "2:19:VMMouse",
                     "pointer",
-                    json!({"left_handed": "disabled"}),
+                    json!({"natural_scroll": "disabled"}),
+                ),
+                device(
+                    "2:19:VMMouse",
+                    "pointer",
+                    json!({"accel_speed": speed, "natural_scroll": "disabled"}),
                 ),
             ])
         };
         assert_eq!(
             pointers(0.0).changes(&pointers(0.5)),
-            [("pointer".to_string(), "accel_speed".to_string(), json!(0.5))]
+            [change("pointer", "accel_speed", json!(0.5))]
         );
     }
 
     #[test]
-    fn settings_reported_as_null_do_not_count() {
+    fn settings_reported_as_null_count_as_left_out() {
         let pointers = |speed: f64| {
             state(&[
                 device("1:1:Mouse", "pointer", json!({"accel_speed": speed})),
-                device(
-                    "2:2:Absolute",
-                    "pointer",
-                    json!({"accel_speed": null, "tap": null}),
-                ),
+                device("2:2:Absolute", "pointer", json!({"accel_speed": null})),
             ])
         };
         assert_eq!(
             pointers(0.0).changes(&pointers(0.25)),
-            [(
-                "pointer".to_string(),
-                "accel_speed".to_string(),
-                json!(0.25)
-            )]
+            [change("pointer", "accel_speed", json!(0.25))]
         );
+    }
+
+    #[test]
+    fn a_change_still_holds_until_the_devices_change_it_or_change() {
+        let pads = |tap: &str| state(&[device("1:1:Pad", "touchpad", json!({"tap": tap}))]);
+        let before = pads("enabled");
+        let tap = change("touchpad", "tap", json!("enabled"));
+        assert!(pads("enabled").still_holds(&before, &tap));
+        assert!(!pads("disabled").still_holds(&before, &tap));
+        let plugged = state(&[
+            device("1:1:Pad", "touchpad", json!({"tap": "enabled"})),
+            device("2:2:Pad", "touchpad", json!({"tap": "enabled"})),
+        ]);
+        assert!(!plugged.still_holds(&before, &tap));
     }
 
     #[test]
