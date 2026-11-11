@@ -40,6 +40,7 @@ where
     T: ToVariant + FromVariant + PartialEq,
 {
     if settings.get::<T>(key) != value {
+        info!("Mirroring sway's {key} {} to gsettings", value.to_variant());
         settings.set(key, &value)?;
     }
     Ok(())
@@ -210,5 +211,60 @@ impl SwayTypeToPrimitive<&str> for ClickMethod {
             ClickMethod::Clickfinger => "clickfinger",
             _ => "none",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn speeds_are_mirrored_at_the_precision_sway_keeps() {
+        assert_eq!(gsettings_speed(0.1_f32 as f64), 0.1);
+        assert_eq!(gsettings_speed(-0.5), -0.5);
+        assert_eq!(gsettings_speed(0.7_f32 as f64), 0.7);
+    }
+
+    /// Mirroring writes a key only when its value differs, so sway's state
+    /// never causes a redundant GSettings write.
+    #[test]
+    fn only_values_that_differ_are_written() {
+        const MOUSE: &str = "org.gnome.desktop.peripherals.mouse";
+        let installed = gio::SettingsSchemaSource::default()
+            .and_then(|source| source.lookup(MOUSE, true))
+            .is_some();
+        if !installed {
+            eprintln!("{MOUSE} is not installed, skipping");
+            return;
+        }
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let settings = Settings::with_backend(MOUSE, &gio::memory_settings_backend_new());
+                let writes = Rc::new(Cell::new(0));
+                let counter = writes.clone();
+                settings.connect_changed(None, move |_, _| counter.set(counter.get() + 1));
+                let written = || {
+                    while context.iteration(false) {}
+                    writes.get()
+                };
+                // natural-scroll and speed start at false and 0.
+                set_enabled_if_changed(&settings, "natural-scroll", &json!("disabled")).unwrap();
+                assert_eq!(written(), 0);
+                set_enabled_if_changed(&settings, "natural-scroll", &json!("enabled")).unwrap();
+                assert_eq!(written(), 1);
+                set_enabled_if_changed(&settings, "natural-scroll", &json!("enabled")).unwrap();
+                set_enabled_if_changed(&settings, "natural-scroll", &json!(null)).unwrap();
+                set_if_changed(&settings, "speed", 0.0).unwrap();
+                assert_eq!(written(), 1);
+                set_if_changed(&settings, "speed", 0.25).unwrap();
+                assert_eq!(written(), 2);
+                assert!(settings.boolean("natural-scroll"));
+                assert_eq!(settings.double("speed"), 0.25);
+            })
+            .unwrap();
     }
 }

@@ -16,13 +16,12 @@ use keyboard::KeyboardHandler;
 use log::{debug, error, info, warn};
 use mouse::MouseHandler;
 use serde::Deserialize;
-use serde_json::Value;
 use shortcuts::ShortcutsHandler;
 use std::error::Error;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
-use sway_state::SwayState;
+use sway_state::{Change, SwayState};
 use swayipc::Connection as SwayConnection;
 use touchpad::TouchpadHandler;
 use traits::InputHandler;
@@ -243,14 +242,19 @@ impl Owner {
     }
 
     /// Write settings sway's devices changed to GSettings.
-    fn mirror(&self, changes: Vec<(String, String, Value)>) {
-        for (input_type, setting, value) in changes {
+    fn mirror(&self, changes: Vec<Change>) {
+        for Change {
+            input_type,
+            setting,
+            value,
+        } in changes
+        {
             let handler = self
                 .handlers
                 .iter()
                 .find(|h| h.sway_input_type() == Some(input_type.as_str()));
             if let Some(handler) = handler {
-                info!("Sway set {input_type} {setting} to {value}, mirroring it to gsettings");
+                debug!("Sway set {input_type} {setting} to {value}");
                 if let Err(e) = handler.sync_gsettings(&setting, &value) {
                     error!("Failed to mirror {input_type} {setting} to gsettings: {e}");
                 }
