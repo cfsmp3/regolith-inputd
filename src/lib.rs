@@ -1,14 +1,17 @@
 mod cursor;
+mod ibus_engines;
 mod input_method;
 mod input_sources;
 mod keyboard;
 mod mouse;
+mod shell;
 mod shortcuts;
 pub mod source_switching;
 mod sway_state;
 mod touchpad;
 mod traits;
 mod utils;
+mod xml;
 
 use cursor::CursorHandler;
 use input_sources::InputSourcesHandler;
@@ -57,6 +60,8 @@ pub(crate) enum Message {
     /// sway has loaded its configuration again: a `reload_done` tick, or
     /// sway's own workspace "reload" event.
     ReloadDone,
+    /// IBus reported an engine list that differs from the one in force.
+    IbusEngines,
 }
 
 // Structs
@@ -125,6 +130,7 @@ impl Owner {
                 Some(Message::SwayHotplug) => self.hotplugged(),
                 Some(Message::ReloadPending) => self.reloading(false),
                 Some(Message::ReloadDone) => self.reloading(true),
+                Some(Message::IbusEngines) => self.follow_engine_list(),
                 None => self.settled(),
             }
         }
@@ -186,6 +192,21 @@ impl Owner {
     }
 
     fn apply_change(&mut self, index: usize, key: &str) {
+        self.apply(|handlers| handlers[index].apply_changes(key));
+    }
+
+    /// Let every handler follow a new engine list from IBus.
+    fn follow_engine_list(&mut self) {
+        self.apply(|handlers| {
+            for handler in handlers.iter_mut() {
+                handler.engine_list_changed()?;
+            }
+            Ok(())
+        });
+    }
+
+    /// Apply a change from GSettings or IBus to sway.
+    fn apply(&mut self, change: impl FnOnce(&mut Handlers) -> Result<(), Box<dyn Error>>) {
         // A change made in sway that hasn't settled yet, but is too old to
         // be a reload's, is a person's. Taking sway's state after applying
         // GSettings would hide it, so note it first.
@@ -204,7 +225,7 @@ impl Owner {
             }
             _ => None,
         };
-        if let Err(e) = self.handlers[index].apply_changes(key) {
+        if let Err(e) = change(&mut self.handlers) {
             error!("{e}");
         }
         // During a reload, everything is applied again once it ends.
@@ -283,6 +304,13 @@ impl SettingsManager {
 
     pub fn start_monitoring(&mut self) -> Result<(), Box<dyn Error + '_>> {
         let (sender, messages) = mpsc::channel();
+        // Watch before the first source list is applied, so that no engine
+        // list IBus reports after that is missed.
+        let engines = sender.clone();
+        ibus_engines::watch().attach(None, move |()| {
+            let _ = engines.send(Message::IbusEngines);
+            glib::Continue(true)
+        });
         for (index, handler) in self.handlers.iter_mut().enumerate() {
             handler.apply_all()?;
             handler.monitor_gsettings_change(index, sender.clone());

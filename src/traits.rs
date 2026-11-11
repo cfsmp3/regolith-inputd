@@ -78,6 +78,11 @@ pub trait InputHandler {
         Ok(())
     }
 
+    /// IBus reported a new engine list (see [`crate::ibus_engines`]).
+    fn engine_list_changed(&mut self) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
     /// Tell the owner of the handlers, as handler `index`, about every
     /// change to this handler's schema.
     fn monitor_gsettings_change(&self, index: usize, sender: Sender<Message>) {

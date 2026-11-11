@@ -38,6 +38,10 @@
 //! when the daemon never saw it gone. Outputs going away add no global and
 //! are left alone.
 //!
+//! Each time it connects to an `ibus-daemon`, the daemon reads the engines
+//! that ibus-daemon lists: from then on they decide which IBus sources count
+//! (see [`crate::ibus_engines`]), as in GNOME.
+//!
 //! The source in use is the counted source (see
 //! [`crate::input_sources::effective_sources`]) at the keyboard's active
 //! layout index in sway. An IBus source selects its own engine; an xkb
@@ -56,15 +60,16 @@
 //! 1.5.35). An IBus the user starts themselves is not affected by the
 //! setting.
 
-use crate::input_sources::{ibus_engines, EffectiveSource};
+use crate::ibus_engines::{self, Engines};
+use crate::input_sources::EffectiveSource;
 use crate::utils;
 use gio::{
     BusType, Cancellable, DBusCallFlags, DBusConnection, DBusConnectionFlags, DBusSignalFlags,
 };
-use glib::ToVariant;
-use log::{info, warn};
+use glib::{ToVariant, Variant};
+use log::{debug, info, warn};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -141,8 +146,8 @@ struct State {
     /// Whether an output changed since the supervisor last looked.
     outputs_changed: bool,
     /// The engine IBus last reported as selected, not yet seen by the
-    /// supervisor.
-    global_engine: Option<String>,
+    /// supervisor, with the number of the connection that reported it.
+    global_engine: Option<(u64, String)>,
 }
 
 impl Shared {
@@ -278,6 +283,14 @@ struct Supervisor {
     preloaded: Option<Vec<String>>,
     /// The `ibus-ui-gtk3` this supervisor started.
     panel: Option<Started>,
+    /// Whether the engine list of the `ibus-daemon` behind `bus` was read.
+    engines_listed: bool,
+    /// How many connections to an `ibus-daemon` were made: the number of
+    /// the one in `bus`.
+    connections: u64,
+    /// Since when an `ibus-daemon` this supervisor didn't start has been
+    /// running without becoming reachable.
+    foreign_daemon_since: Option<Instant>,
     /// The `ibus-x11` this supervisor started.
     xim: Option<Started>,
     next_daemon_start: Instant,
@@ -309,6 +322,9 @@ impl Supervisor {
             selected: None,
             preloaded: None,
             panel: None,
+            engines_listed: false,
+            connections: 0,
+            foreign_daemon_since: None,
             xim: None,
             next_daemon_start: now,
             daemon_delay: RESTART_DELAY,
@@ -350,6 +366,7 @@ impl Supervisor {
             self.recover_panel();
             self.keep_panel();
             self.stop_second_panels();
+            self.follow_engine_list();
             self.preload_engines();
             self.select_engine();
             self.keep_xim();
@@ -373,7 +390,12 @@ impl Supervisor {
         let sources = state.sources.take();
         let keyboards_changed = std::mem::take(&mut state.keyboards_changed);
         let outputs_changed = std::mem::take(&mut state.outputs_changed);
-        let global_engine = state.global_engine.take();
+        // A report from an earlier ibus-daemon says nothing about this one.
+        let global_engine = state
+            .global_engine
+            .take()
+            .filter(|(connection, _)| *connection == self.connections)
+            .map(|(_, engine)| engine);
         drop(state);
         if outputs_changed {
             self.follow_outputs();
@@ -548,6 +570,8 @@ impl Supervisor {
         let panel_daemons = daemons_running_a_panel();
         if let Some(bus) = connect(&programs).filter(|_| panel_daemons.is_empty()) {
             info!("Connected to the input method");
+            self.connections += 1;
+            let connection = self.connections;
             let shared = self.shared.clone();
             bus.signal_subscribe(
                 None,
@@ -558,11 +582,17 @@ impl Supervisor {
                 DBusSignalFlags::NONE,
                 move |_, _, _, _, _, parameters| {
                     if let Some((engine,)) = parameters.get::<(String,)>() {
-                        shared.update(|state| state.global_engine = Some(engine));
+                        shared.update(|state| state.global_engine = Some((connection, engine)));
                     }
                 },
             );
             self.bus = Some(bus);
+            // Nothing is selected or preloaded in this ibus-daemon yet,
+            // whatever an earlier one reported, and its engines are read.
+            self.selected = None;
+            self.preloaded = None;
+            self.engines_listed = false;
+            self.foreign_daemon_since = None;
             self.daemon_delay = RESTART_DELAY;
             return;
         }
@@ -585,6 +615,18 @@ impl Supervisor {
         if now < self.next_daemon_start {
             return;
         }
+        // An ibus-daemon someone else started (an IBus tool, the user
+        // restarting IBus) may still be starting: it is given the time a new
+        // one gets to become reachable before it is replaced. One that runs a
+        // panel of its own is replaced at once, as above, and one of another
+        // session's display is left alone.
+        if self.daemon.is_none() && panel_daemons.is_empty() && !daemons_on_display().is_empty() {
+            let since = *self.foreign_daemon_since.get_or_insert(now);
+            if now.duration_since(since) < STARTUP_TIMEOUT {
+                return;
+            }
+        }
+        self.foreign_daemon_since = None;
         // ibus-daemon exits with its parent. A shell waits for it instead, so
         // that a restart of this daemon leaves the input method running for
         // the next instance to use. --replace takes over from an ibus-daemon
@@ -608,6 +650,24 @@ impl Supervisor {
         }
         self.next_daemon_start = now + self.daemon_delay;
         self.daemon_delay = (self.daemon_delay * 2).min(MAX_RESTART_DELAY);
+    }
+
+    /// Read the engine list of the `ibus-daemon` just connected to, until it
+    /// answers. From its answer on, IBus decides which engines exist; the
+    /// list stays in force until the next `ibus-daemon` answers.
+    fn follow_engine_list(&mut self) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        if self.engines_listed {
+            return;
+        }
+        // An ibus-daemon still starting may not answer yet: it is asked
+        // again at the next check.
+        if let Some(engines) = list_engines(bus) {
+            self.engines_listed = true;
+            ibus_engines::follow_ibus(engines);
+        }
     }
 
     /// Have IBus start the engines of every counted source ahead of their
@@ -740,6 +800,60 @@ fn connect(programs: &Programs) -> Option<DBusConnection> {
     .ok()
 }
 
+/// The engines `ibus-daemon` lists (its `Engines` property), if it answers.
+fn list_engines(bus: &DBusConnection) -> Option<Engines> {
+    let reply = bus
+        .call_sync(
+            Some("org.freedesktop.IBus"),
+            "/org/freedesktop/IBus",
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            Some(&("org.freedesktop.IBus", "Engines").to_variant()),
+            None,
+            DBusCallFlags::NONE,
+            5000,
+            Cancellable::NONE,
+        )
+        .map_err(|e| debug!("The input method does not list its engines: {e}"))
+        .ok()?;
+    engine_descriptions(&reply.try_child_value(0)?.as_variant()?)
+}
+
+/// The engines of an `Engines` value: an array of serialized
+/// `IBusEngineDesc` objects, each a variant holding its type name, its
+/// attachments, then its fields in order (name, long name, description,
+/// language, license, author, icon, layout, rank, hotkeys, symbol, setup,
+/// layout variant, layout option, …).
+fn engine_descriptions(list: &Variant) -> Option<Engines> {
+    const NAME: usize = 2;
+    const LAYOUT: usize = 9;
+    const LAYOUT_VARIANT: usize = 14;
+    if !list.is_container() {
+        return None;
+    }
+    let mut engines = Engines::new();
+    for desc in list.iter() {
+        let desc = desc.as_variant().unwrap_or(desc);
+        if !desc.is_container() || desc.n_children() <= LAYOUT_VARIANT {
+            continue;
+        }
+        let field = |index| {
+            desc.try_child_value(index)
+                .and_then(|v| v.str().map(String::from))
+        };
+        if field(0).as_deref() != Some("IBusEngineDesc") {
+            continue;
+        }
+        let (Some(name), Some(layout), Some(variant)) =
+            (field(NAME), field(LAYOUT), field(LAYOUT_VARIANT))
+        else {
+            continue;
+        };
+        engines.insert(name, ibus_engines::engine_layout(&layout, &variant));
+    }
+    Some(engines)
+}
+
 fn preload_engines(bus: &DBusConnection, engines: &[String]) -> Result<(), glib::Error> {
     bus.call_sync(
         Some("org.freedesktop.IBus"),
@@ -818,16 +932,23 @@ fn signal(pid: u32, signal: libc::c_int) {
     }
 }
 
-/// The `ibus-daemon`s of this user on the session's display that run a
-/// panel of their own.
-fn daemons_running_a_panel() -> Vec<u32> {
+/// The `ibus-daemon`s of this user on the session's display.
+fn daemons_on_display() -> Vec<u32> {
     let display = env::var_os("WAYLAND_DISPLAY");
     own_processes("ibus-daemon")
         .into_iter()
+        .filter(|pid| on_display(&read_proc(*pid, "environ"), display.as_deref()))
+        .collect()
+}
+
+/// The `ibus-daemon`s of this user on the session's display that run a
+/// panel of their own.
+fn daemons_running_a_panel() -> Vec<u32> {
+    daemons_on_display()
+        .into_iter()
         .filter(|pid| {
             let cmdline = read_proc(*pid, "cmdline");
-            on_display(&read_proc(*pid, "environ"), display.as_deref())
-                && runs_own_panel(cmdline.split(|b| *b == 0).skip(1))
+            runs_own_panel(cmdline.split(|b| *b == 0).skip(1))
         })
         .collect()
 }
@@ -932,7 +1053,7 @@ fn engines_for(sources: &[EffectiveSource]) -> Vec<String> {
         .map(|source| match &source.engine {
             Some(engine) => engine.clone(),
             None => xkb_engine(
-                installed.get_or_insert_with(ibus_engines),
+                installed.get_or_insert_with(ibus_engines::installed),
                 &source.layout,
                 &source.variant,
             ),
@@ -942,11 +1063,7 @@ fn engines_for(sources: &[EffectiveSource]) -> Vec<String> {
 
 /// IBus's XKB engine for a layout and variant: the first by name of the
 /// installed `xkb:` engines with that layout and variant.
-fn xkb_engine(
-    installed: &HashMap<String, (String, String)>,
-    layout: &str,
-    variant: &str,
-) -> String {
+fn xkb_engine(installed: &Engines, layout: &str, variant: &str) -> String {
     installed
         .iter()
         .filter(|(name, (l, v))| name.starts_with("xkb:") && l == layout && v == variant)
@@ -1022,9 +1139,13 @@ fn follow_sway_events(shared: &Shared) -> Fallible<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_layout, is_true, on_display, runs_own_panel, xkb_engine, DEFAULT_ENGINE};
+    use super::{
+        active_layout, engine_descriptions, is_true, on_display, runs_own_panel, xkb_engine,
+        DEFAULT_ENGINE,
+    };
+    use crate::ibus_engines::Engines;
+    use glib::{ToVariant, Variant};
     use serde_json::json;
-    use std::collections::HashMap;
     use std::ffi::OsStr;
 
     fn args(cmdline: &str) -> Vec<&[u8]> {
@@ -1083,7 +1204,7 @@ mod tests {
 
     #[test]
     fn xkb_sources_select_the_xkb_engine_of_their_layout() {
-        let installed: HashMap<String, (String, String)> = [
+        let installed: Engines = [
             ("xkb:us::eng", "us", ""),
             ("xkb:us:intl:eng", "us", "intl"),
             ("xkb:us:altgr-intl:fra", "us", "altgr-intl"),
@@ -1142,5 +1263,48 @@ mod tests {
         let same = super::active_outputs(&[json!({"name": "eDP-1", "id": 3, "active": true})]);
         assert_eq!(again.difference(&before).count(), 1);
         assert_eq!(same.difference(&before).count(), 0);
+    }
+
+    /// A serialized `IBusEngineDesc`, as ibus-daemon sends it.
+    fn engine_desc(name: &str, layout: &str, variant: &str) -> Variant {
+        let attachments = Variant::array_from_iter_with_type(
+            glib::VariantTy::new("{sv}").unwrap(),
+            Vec::<Variant>::new(),
+        );
+        let mut fields = vec!["IBusEngineDesc".to_variant(), attachments];
+        for text in [name, "long", "desc", "ja", "GPL", "author", "icon", layout] {
+            fields.push(text.to_variant());
+        }
+        fields.push(80u32.to_variant());
+        for text in ["", "symbol", "", variant, "option", "1.0", "domain", ""] {
+            fields.push(text.to_variant());
+        }
+        Variant::tuple_from_iter(fields)
+    }
+
+    #[test]
+    fn ibus_engine_lists_are_decoded() {
+        let list = Variant::array_from_iter_with_type(
+            glib::VariantTy::VARIANT,
+            [
+                Variant::from_variant(&engine_desc("anthy", "default", "")),
+                Variant::from_variant(&engine_desc("hangul", "kr", "kr104")),
+                Variant::from_variant(&engine_desc(
+                    "m17n:hi:inscript",
+                    "default[lv3:ralt_switch]",
+                    "default",
+                )),
+                Variant::from_variant(&"not an engine".to_variant()),
+            ],
+        );
+        let engines = engine_descriptions(&list).unwrap();
+        assert_eq!(engines.len(), 3);
+        assert_eq!(engines["anthy"], ("us".to_string(), String::new()));
+        assert_eq!(engines["hangul"], ("kr".to_string(), "kr104".to_string()));
+        assert_eq!(
+            engines["m17n:hi:inscript"],
+            ("us".to_string(), String::new())
+        );
+        assert_eq!(engine_descriptions(&"x".to_variant()), None);
     }
 }
