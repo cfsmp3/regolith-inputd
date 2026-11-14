@@ -1,3 +1,17 @@
+regolith-inputd (0.6.0) jammy; urgency=medium
+
+  [ rego-port-bot ]
+  * feat: mirror GNOME keyboard shortcuts to sway
+  * fix: skip built-in shortcuts the media-keys schema does not have
+  * docs: list the media-keys shortcuts that are not mirrored yet
+  * fix: put the start limit in the [Unit] section
+  * feat: mirror the Sound and Media and System shortcuts from Settings to sway
+  * feat: run IBus in the sway session and follow the input source in use
+  * feat: follow GNOME's input-source switching rules in sway
+  * fix(debian): replace the dh_make placeholders in Section and Homepage
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 14 Nov 2026 10:13:27 -0800
+
 regolith-inputd (0.5.0) jammy; urgency=medium
 
   [ Ken Gilmer ]
