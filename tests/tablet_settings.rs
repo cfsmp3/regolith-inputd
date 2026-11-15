@@ -80,3 +80,65 @@ fn tablet_settings_are_applied_at_startup_and_on_change() {
         Some(format!("input \"{PAD}\" left_handed disabled").as_str())
     );
 }
+
+/// A tablet whose device names sway turns into identifiers with quotes,
+/// backslashes, `$` and command separators, and one ending in a backslash,
+/// which sway can't be sent as part of a command.
+const ODD_INPUTS: &str = r#"[
+  {"identifier": "1386:856:Pen_\"odd\"_$mod_it's", "name": "Pen \"odd\" $mod it's",
+   "vendor": 1386, "product": 856, "type": "tablet_tool",
+   "libinput": {"send_events": "enabled", "left_handed": "disabled"}},
+  {"identifier": "1386:856:Pad_a\\b;c,d'", "name": "Pad a\\b;c,d'",
+   "vendor": 1386, "product": 856, "type": "tablet_pad",
+   "libinput": {"send_events": "enabled", "left_handed": "disabled"}},
+  {"identifier": "1386:856:Bad_Pen\\", "name": "Bad Pen\\",
+   "vendor": 1386, "product": 856, "type": "tablet_tool",
+   "libinput": {"send_events": "enabled", "left_handed": "disabled"}}
+]"#;
+
+#[test]
+fn odd_identifiers_are_quoted_the_way_sway_reads_them() {
+    let (sway, daemon) = Daemon::start_with_inputs(
+        "tablet-odd-identifiers",
+        "[org/gnome/desktop/input-sources]\n\
+         sources=[('xkb', 'us')]\n\
+         [org/gnome/desktop/peripherals/tablets/056a:0358]\n\
+         left-handed=true\n",
+        ODD_INPUTS,
+    );
+    sway.wait_for_startup();
+    // Sway removes the quotes, keeps backslashes and turns `$$` into `$`,
+    // so it reads `1386:856:Pen_"odd"_$mod_it's` and `1386:856:Pad_a\b;c,d'`.
+    let pen = r#"'1386:856:Pen_"odd"_$$mod_it'"'s""#;
+    let pad = r#""1386:856:Pad_a\b;c,d'""#;
+    let commands = sway.commands();
+    for expected in [
+        format!("input {pen} tool_mode * absolute"),
+        format!("input {pen} left_handed enabled"),
+        format!("input {pad} left_handed enabled"),
+    ] {
+        assert!(
+            commands.contains(&expected),
+            "no {expected:?} in {commands:?}"
+        );
+    }
+    assert!(
+        !commands.iter().any(|c| c.contains("Bad_Pen")),
+        "an identifier ending in a backslash reached sway: {commands:?}"
+    );
+
+    assert_eq!(
+        change(
+            &sway,
+            &daemon,
+            (
+                "org.gnome.desktop.peripherals.tablet:/org/gnome/desktop/peripherals/tablets/056a:0358/",
+                "left-handed",
+                "false"
+            ),
+            &format!("input {pad} left_handed")
+        )
+        .as_deref(),
+        Some(format!("input {pad} left_handed disabled").as_str())
+    );
+}
