@@ -109,7 +109,7 @@ fn odd_identifiers_are_quoted_the_way_sway_reads_them() {
     sway.wait_for_startup();
     // Sway removes the quotes, keeps backslashes and turns `$$` into `$`,
     // so it reads `1386:856:Pen_"odd"_$mod_it's` and `1386:856:Pad_a\b;c,d'`.
-    let pen = r#"'1386:856:Pen_"odd"_$$mod_it'"'s""#;
+    let pen = r#""1386:856:Pen_"'"odd"_$$mod_it'"'s""#;
     let pad = r#""1386:856:Pad_a\b;c,d'""#;
     let commands = sway.commands();
     for expected in [

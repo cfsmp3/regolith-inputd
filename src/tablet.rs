@@ -25,6 +25,7 @@
 //! other handlers use.
 
 use crate::libwacom::{TabletDatabase, TabletInfo};
+use crate::quoting::sway_argument;
 use crate::utils;
 use gio::{prelude::*, Settings, SettingsSchemaSource};
 use glib::SignalHandlerId;
@@ -355,107 +356,16 @@ fn active_region(
     }
 }
 
-/// Writes `value` as one argument of a sway command that sway reads back as
-/// exactly `value`, or returns `None` when sway can't receive it.
-///
-/// Over IPC, sway removes the quotes of an argument that starts with one but
-/// keeps every backslash, where a backslash still escapes the character
-/// after it. It then replaces `$name` with its variables in every argument
-/// but the command name. So the value is written as adjacent quoted runs:
-/// the parts with a `"` in single quotes, the rest in double quotes, which
-/// leaves plain values as they always were. A run never ends on a backslash,
-/// which would escape its closing quote, so a value that ends in an odd
-/// number of backslashes can't be written. Neither can a line feed, which
-/// sway turns into a `;`. Each `$` is doubled, except one right after exactly
-/// one backslash, which sway leaves alone.
-fn sway_argument(value: &str) -> Option<String> {
-    let chars: Vec<char> = value.chars().collect();
-    let trailing_backslashes = chars.iter().rev().take_while(|&&c| c == '\\').count();
-    if value.contains(['\n', '\0']) || trailing_backslashes % 2 == 1 {
-        return None;
-    }
-    // Runs as (quote, first char, end), each without its own quote char.
-    let mut runs = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
-    for (i, &c) in chars.iter().enumerate() {
-        let needed = match c {
-            '"' => '\'',
-            '\'' => '"',
-            _ => continue,
-        };
-        match quote {
-            Some(q) if q != needed => {
-                // The backslashes before `c` move to the next run, where
-                // they precede a literal quote rather than the closing one.
-                // The run holds the quote that chose `q`, so it stays
-                // non-empty.
-                let mut end = i;
-                while chars[end - 1] == '\\' {
-                    end -= 1;
-                }
-                runs.push((q, start, end));
-                start = end;
-                quote = Some(needed);
-            }
-            Some(_) => {}
-            None => quote = Some(needed),
-        }
-    }
-    runs.push((quote.unwrap_or('"'), start, chars.len()));
-    let mut argument = String::with_capacity(value.len() + 2 * runs.len());
-    for (q, start, end) in runs {
-        argument.push(q);
-        for i in start..end {
-            argument.push(chars[i]);
-            let skipped_by_sway =
-                i >= 1 && chars[i - 1] == '\\' && (i == 1 || chars[i - 2] != '\\');
-            if chars[i] == '$' && !skipped_by_sway {
-                argument.push('$');
-            }
-        }
-        argument.push(q);
-    }
-    Some(argument)
-}
-
-/// Whether sway reads `command` as a single command. It splits a list of
-/// commands at each `;` and `,` outside quotes that a backslash doesn't
-/// escape, and when splitting, a backslash also escapes the quotes that
-/// directly follow the character after it. Arguments written by
-/// `sway_argument` can trip that up only when they contain a `;` or `,`.
-fn is_one_command(command: &str) -> bool {
-    let (mut in_double, mut in_single, mut escaped) = (false, false, false);
-    let mut next = 0;
-    for (i, c) in command.char_indices() {
-        if !matches!(c, '"' | '\'' | '\\' | ';' | ',') {
-            continue;
-        }
-        if escaped && i != next {
-            escaped = false;
-        }
-        match c {
-            '"' if !in_single && !escaped => in_double = !in_double,
-            '\'' if !in_double && !escaped => in_single = !in_single,
-            '\\' => escaped = !escaped,
-            ';' | ',' if !in_double && !in_single && !escaped => return false,
-            _ => {}
-        }
-        next = i + 1;
-    }
-    true
-}
-
 /// `input <identifier> <option>`, or `None` with a warning when sway can't
 /// receive the identifier intact.
 fn input_command(identifier: &str, option: &str) -> Option<String> {
-    let command = sway_argument(identifier)
-        .map(|id| format!("input {id} {option}"))
-        .filter(|command| is_one_command(command));
-    if command.is_none() {
-        warn!("Not sending {option:?} to input {identifier:?}: sway can't read that identifier");
+    match sway_argument(identifier, '"', false) {
+        Ok(id) => Some(format!("input {id} {option}")),
+        Err(e) => {
+            warn!("Not sending {option:?} to input {identifier:?}: sway can't receive its identifier, {e}");
+            None
+        }
     }
-    command
 }
 
 /// Which settings an apply sends.
@@ -532,8 +442,8 @@ fn device_commands(
     let screen_tablet = info.is_some_and(TabletInfo::is_screen_tablet);
     let mut commands = Vec::new();
     let mut mapped = was_mapped;
-    if sway_argument(id).is_none() {
-        warn!("Skipping tablet device {id:?}: sway can't read its identifier");
+    if let Err(e) = sway_argument(id, '"', false) {
+        warn!("Skipping tablet device {id:?}: sway can't receive its identifier, {e}");
         return (commands, mapped);
     }
     if device.input_type == TABLET_TOOL {
@@ -552,10 +462,10 @@ fn device_commands(
                 Mapping::SwayDefault => None,
             };
             if let Some(target) = target {
-                let command = match sway_argument(target) {
-                    Some(output) => input_command(id, &format!("map_to_output {output}")),
-                    None => {
-                        warn!("Not mapping {id:?} to output {target:?}: sway can't read its name");
+                let command = match sway_argument(target, '"', true) {
+                    Ok(output) => input_command(id, &format!("map_to_output {output}")),
+                    Err(e) => {
+                        warn!("Not mapping {id:?} to output {target:?}: sway can't receive its name, {e}");
                         None
                     }
                 };
@@ -805,6 +715,7 @@ impl TabletState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quoting::sway::reads as sway_reads;
     use serde_json::json;
 
     fn device(identifier: &str, input_type: &str) -> Input {
@@ -1088,165 +999,6 @@ mod tests {
         assert!(mapped);
     }
 
-    /// Sway variables, longest name first as sway sorts them.
-    const VARIABLES: [(&str, &str); 4] = [
-        ("$wm.layout", "de"),
-        ("$mod", "Mod4"),
-        ("$a", "VAR"),
-        ("$", "DOLLAR"),
-    ];
-
-    /// The commands sway 1.11 runs for an IPC command list, as the
-    /// arguments each handler gets: a port of `execute_command`
-    /// (sway/commands.c), with `argsep`, `split_args` and `strip_quotes`
-    /// (common/stringop.c) and `do_var_replacement` (sway/config.c).
-    fn sway_reads(payload: &str) -> Vec<Vec<String>> {
-        // Line feeds and criteria aren't ported.
-        assert!(!payload.contains('\n') && !payload.starts_with('['));
-        let mut commands = Vec::new();
-        let mut head = Some(payload);
-        while let Some(rest) = head {
-            let (command, next) = argsep(rest.trim_start());
-            head = next;
-            let command = command.trim_start();
-            if command.is_empty() {
-                continue;
-            }
-            let mut argv = split_args(command);
-            let strips = !matches!(argv[0].as_str(), "exec" | "exec_always" | "mode");
-            for arg in argv.iter_mut().skip(1) {
-                if strips && arg.starts_with(['"', '\'']) {
-                    *arg = strip_quotes(arg);
-                }
-                *arg = var_replacement(arg);
-            }
-            commands.push(argv);
-        }
-        commands
-    }
-
-    const SWAY_WHITESPACE: [char; 6] = [' ', '\x0c', '\n', '\r', '\t', '\x0b'];
-
-    /// One command of a list, and the rest of the list.
-    fn argsep(list: &str) -> (&str, Option<&str>) {
-        let b = list.as_bytes();
-        let (mut start, mut end) = (0, 0);
-        let (mut in_string, mut in_char, mut escaped) = (false, false, false);
-        while let Some(offset) = b[end..].iter().position(|c| b"\"'\\;,".contains(c)) {
-            let i = end + offset;
-            if escaped && i != end {
-                escaped = false;
-            }
-            match b[i] {
-                b'"' if !in_char && !escaped => in_string = !in_string,
-                b'\'' if !in_string && !escaped => in_char = !in_char,
-                b'\\' => escaped = !escaped,
-                b';' | b',' if !in_string && !in_char && !escaped => {
-                    if i > start {
-                        return (&list[start..i], Some(&list[i + 1..]));
-                    }
-                    start = i + 1;
-                }
-                _ => {}
-            }
-            end = i + 1;
-        }
-        (&list[start..], None)
-    }
-
-    fn split_args(command: &str) -> Vec<String> {
-        let b = command.as_bytes();
-        let is_space = |c: u8| SWAY_WHITESPACE.contains(&(c as char));
-        let mut args = Vec::new();
-        let (mut start, mut end) = (0, 0);
-        let (mut in_token, mut in_string, mut in_char) = (false, false, false);
-        let (mut in_brackets, mut escaped) = (false, false);
-        while start < b.len() {
-            if !in_token {
-                while end < b.len() && is_space(b[end]) {
-                    end += 1;
-                }
-                start = end;
-                in_token = true;
-            }
-            let c = b.get(end).copied().unwrap_or(0);
-            if c == b'"' && !in_char && !escaped {
-                in_string = !in_string;
-            } else if c == b'\'' && !in_string && !escaped {
-                in_char = !in_char;
-            } else if c == b'[' && !in_string && !in_char && !in_brackets && !escaped {
-                in_brackets = true;
-            } else if c == b']' && !in_string && !in_char && in_brackets && !escaped {
-                in_brackets = false;
-            } else if c == b'\\' {
-                escaped = !escaped;
-            } else if c == 0 || (!in_string && !in_char && !in_brackets && !escaped && is_space(c))
-            {
-                if end > start {
-                    args.push(command[start..end].to_string());
-                }
-                in_token = false;
-                escaped = false;
-                continue;
-            }
-            if c != b'\\' {
-                escaped = false;
-            }
-            end += 1;
-        }
-        args
-    }
-
-    fn strip_quotes(arg: &str) -> String {
-        let (mut in_str, mut in_chr, mut escaped) = (false, false, false);
-        let mut out = String::new();
-        for c in arg.chars() {
-            if c == '\'' && !in_str && !escaped {
-                in_chr = !in_chr;
-            } else if c == '"' && !in_chr && !escaped {
-                in_str = !in_str;
-            } else if c == '\\' {
-                escaped = !escaped;
-                out.push(c);
-            } else {
-                escaped = false;
-                out.push(c);
-            }
-        }
-        out
-    }
-
-    fn var_replacement(arg: &str) -> String {
-        let mut s = arg.as_bytes().to_vec();
-        let mut find = 0;
-        while let Some(offset) = s[find..].iter().position(|&c| c == b'$') {
-            find += offset;
-            if find > 0
-                && s[find - 1] == b'\\'
-                && (find == 1 || !(find > 1 && s[find - 2] == b'\\'))
-            {
-                find += 1;
-                continue;
-            }
-            if s.get(find + 1) == Some(&b'$') {
-                s.remove(find);
-                find += 1;
-                continue;
-            }
-            match VARIABLES
-                .iter()
-                .find(|(name, _)| s[find..].starts_with(name.as_bytes()))
-            {
-                Some((name, value)) => {
-                    s.splice(find..find + name.len(), value.bytes());
-                    find += value.len();
-                }
-                None => find += 1,
-            }
-        }
-        String::from_utf8(s).unwrap()
-    }
-
     /// What sway reads from the command that sets left-handed mode.
     fn left_handed_reads(identifier: &str) -> Option<Vec<Vec<String>>> {
         input_command(identifier, "left_handed enabled").map(|c| sway_reads(&c))
@@ -1257,44 +1009,20 @@ mod tests {
     }
 
     #[test]
-    fn the_sway_port_reads_what_sway_1_11_reads() {
-        // Checked with headless sway 1.11 and `sway -d`.
-        for (payload, argument) in [
-            (r#"input "1:2:Pen" left_handed enabled"#, "1:2:Pen"),
-            (r#"input "x\"y" left_handed enabled"#, r#"x\"y"#),
-            (r#"input "a'b"'"c' left_handed enabled"#, r#"a'b"c"#),
+    fn plain_identifiers_are_written_as_before() {
+        for (id, written) in [
             (
-                r#"input '$a $$a \$a \\$a' left_handed enabled"#,
-                r#"VAR $a \$a \\VAR"#,
+                "1386:855:Wacom_Intuos_Pro_M_Pen",
+                r#""1386:855:Wacom_Intuos_Pro_M_Pen""#,
             ),
-            (r#"input 'a\$b' left_handed enabled"#, r#"a\$b"#),
-            (r#"input 'a\\$$b' left_handed enabled"#, r#"a\\$b"#),
-            (r#"input '$wm.layout' left_handed enabled"#, "de"),
+            ("*", r#""*""#),
+            ("", r#""""#),
         ] {
             assert_eq!(
-                sway_reads(payload),
-                vec![strings(&["input", argument, "left_handed", "enabled"])],
-                "{payload}"
+                input_command(id, "left_handed enabled"),
+                Some(format!("input {written} left_handed enabled"))
             );
         }
-        assert_eq!(
-            sway_reads(r#"input "1:2:Pad";exec_x;"" left_handed enabled"#),
-            vec![
-                strings(&["input", "1:2:Pad"]),
-                strings(&["exec_x"]),
-                strings(&["\"\"", "left_handed", "enabled"]),
-            ]
-        );
-    }
-
-    #[test]
-    fn plain_identifiers_are_written_as_before() {
-        assert_eq!(
-            sway_argument("1386:855:Wacom_Intuos_Pro_M_Pen").as_deref(),
-            Some(r#""1386:855:Wacom_Intuos_Pro_M_Pen""#)
-        );
-        assert_eq!(sway_argument("*").as_deref(), Some(r#""*""#));
-        assert_eq!(sway_argument("").as_deref(), Some(r#""""#));
     }
 
     #[test]
@@ -1322,6 +1050,9 @@ mod tests {
             r#"1:2:\$$a"#,
             r#"1:2:Pad";exec_touch_/tmp/x;""#,
             "1:2:a;b,c",
+            // When splitting the command list, sway lets the backslash
+            // escape the quotes after the `'` too.
+            r#"\'"a";"#,
             "1:2:[x]",
             "1:2:with space\tand tab",
             " leading and trailing ",
@@ -1338,7 +1069,7 @@ mod tests {
             "1:2:line\nfeed",
             "1:2:nul\0",
         ] {
-            assert_eq!(sway_argument(id), None, "{id:?}");
+            assert!(sway_argument(id, '"', false).is_err(), "{id:?}");
             let pen = device(id, TABLET_TOOL);
             let (commands, mapped) =
                 device_commands(&pen, None, &settings(), &[], Changes::ALL, false);
@@ -1348,24 +1079,10 @@ mod tests {
     }
 
     #[test]
-    fn identifiers_sway_would_split_are_skipped() {
-        // Quoted right for each argument, but when splitting the command
-        // list, the backslash also escapes the quotes after the `'`, so the
-        // second `"` looks like it ends a quote and the `;` like a separator.
-        let id = r#"\'"a";"#;
-        let argument = sway_argument(id).unwrap();
-        assert_eq!(argument, r#""\'"'"a";'"#);
-        let command = format!("input {argument} left_handed enabled");
-        assert_eq!(sway_reads(&command).len(), 2);
-        assert_eq!(input_command(id, "left_handed enabled"), None);
-    }
-
-    #[test]
-    fn every_short_identifier_reaches_sway_intact_or_is_skipped() {
-        let alphabet = ['a', '\'', '"', '\\', '$', ';', ' '];
+    fn every_short_identifier_reaches_sway_intact_or_ends_in_an_odd_backslash() {
+        let alphabet = ['a', '\'', '"', '\\', '$', ';', ',', ' '];
         let mut values = vec![String::new()];
-        let mut skipped = 0;
-        for _ in 0..5 {
+        for _ in 0..4 {
             values = values
                 .iter()
                 .flat_map(|v| alphabet.iter().map(move |c| format!("{v}{c}")))
@@ -1375,19 +1092,11 @@ mod tests {
                     Some(read) => assert_eq!(read, expected(value), "{value:?}"),
                     None => {
                         let trailing = value.chars().rev().take_while(|&c| c == '\\').count();
-                        // Only a `;` or `,` can trip up how sway splits
-                        // command lists.
-                        assert!(
-                            trailing % 2 == 1 || value.contains([';', ',']),
-                            "{value:?} skipped"
-                        );
-                        skipped += usize::from(trailing % 2 == 0);
+                        assert!(trailing % 2 == 1, "{value:?} skipped");
                     }
                 }
             }
         }
-        // Splitting quirks rule out very few.
-        assert!(skipped < 50, "{skipped} skipped");
     }
 
     #[test]
