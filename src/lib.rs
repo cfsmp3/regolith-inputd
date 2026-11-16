@@ -3,6 +3,7 @@ mod input_method;
 mod input_sources;
 mod keyboard;
 mod mouse;
+mod quoting;
 mod shortcuts;
 pub mod source_switching;
 mod touchpad;

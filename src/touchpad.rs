@@ -1,7 +1,8 @@
+use crate::quoting::sway_argument;
 use crate::traits::{InputHandler, PointerMethods, PrimitiveToSwayType, SwayTypeToPrimitive};
 use crate::utils;
 use gio::{prelude::SettingsExtManual, traits::SettingsExt, Settings};
-use log::info;
+use log::{info, warn};
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -178,7 +179,8 @@ fn sway_click_method(gnome_value: &str) -> Option<&'static str> {
 /// one. Until the daemon has set a click method there is nothing to undo,
 /// so "default" leaves each touchpad as libinput or the user's sway config
 /// set it. After that it restores, per touchpad, what sway reported
-/// before the daemon's first change.
+/// before the daemon's first change; a touchpad whose identifier sway
+/// can't receive intact is skipped.
 fn click_method_commands(
     gnome_value: &str,
     already_set: bool,
@@ -188,7 +190,17 @@ fn click_method_commands(
         Some(method) => vec![format!("input type:touchpad click_method {method}")],
         None if already_set => defaults
             .iter()
-            .map(|(identifier, method)| format!("input \"{identifier}\" click_method {method}"))
+            .filter_map(
+                |(identifier, method)| match sway_argument(identifier, '"', false) {
+                    Ok(input) => Some(format!("input {input} click_method {method}")),
+                    Err(e) => {
+                        warn!(
+                            "Touchpad {identifier:?} keeps its click method: sway can't receive its identifier, {e}"
+                        );
+                        None
+                    }
+                },
+            )
             .collect(),
         None => Vec::new(),
     }
@@ -294,6 +306,25 @@ mod tests {
         assert_eq!(
             click_method_commands("fingers", true, &defaults),
             ["input type:touchpad click_method clickfinger"]
+        );
+    }
+
+    #[test]
+    fn touchpads_are_restored_by_their_exact_identifier() {
+        let defaults = BTreeMap::from([
+            ("1:2:Pad \"A\";exec x".to_string(), "button_areas"),
+            ("3:4:Pad_B\\".to_string(), "clickfinger"),
+            ("5:6:Pad\nC".to_string(), "clickfinger"),
+            ("7:8:Pad_D".to_string(), "none"),
+            ("9:9:Pad_E\\\\".to_string(), "clickfinger"),
+        ]);
+        assert_eq!(
+            click_method_commands("default", true, &defaults),
+            [
+                "input '1:2:Pad \"A\";exec x' click_method button_areas",
+                "input \"7:8:Pad_D\" click_method none",
+                "input \"9:9:Pad_E\"\\\\ click_method clickfinger",
+            ]
         );
     }
 }

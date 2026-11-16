@@ -1,4 +1,5 @@
 use crate::input_method::InputMethod;
+use crate::quoting::{sway_argument, Unquotable};
 use crate::InputHandler;
 use gio::{prelude::SettingsExtManual, Settings};
 use log::{info, warn};
@@ -27,7 +28,8 @@ pub struct EffectiveSource {
 /// The sources in effect, in list order, as in GNOME Shell: an xkb source
 /// applies its own layout (`layout+variant`), an IBus engine the layout and
 /// variant of its installed description. IBus engines with no installed
-/// description, and sources of any other type, are left out.
+/// description, sources of any other type, and sources whose layout or
+/// variant sway can't receive intact are left out.
 pub fn effective_sources(sources: Vec<(String, String)>) -> Vec<EffectiveSource> {
     let mut engines: Option<HashMap<String, (String, String)>> = None;
     let mut effective = Vec::new();
@@ -43,6 +45,13 @@ pub fn effective_sources(sources: Vec<(String, String)>) -> Vec<EffectiveSource>
             },
             _ => continue,
         };
+        let unsendable = [("layout", &layout), ("variant", &variant)]
+            .into_iter()
+            .find_map(|(what, value)| Some((what, value, sway_layout_argument(value).err()?)));
+        if let Some((what, value, e)) = unsendable {
+            warn!("Input source ({kind}, {id:?}) left out: sway can't receive its {what} {value:?}, {e}");
+            continue;
+        }
         effective.push(EffectiveSource {
             source: (kind, id),
             layout,
@@ -157,8 +166,14 @@ impl InputSourcesHandler {
         // layouts, then their variants: each step is valid on its own.
         let cmds = [
             String::from("input type:keyboard xkb_variant ''"),
-            format!("input type:keyboard xkb_layout '{layouts}'"),
-            format!("input type:keyboard xkb_variant '{variants}'"),
+            format!(
+                "input type:keyboard xkb_layout {}",
+                sway_layout_argument(&layouts)?
+            ),
+            format!(
+                "input type:keyboard xkb_variant {}",
+                sway_layout_argument(&variants)?
+            ),
         ];
         for cmd in cmds {
             info!("{cmd}");
@@ -181,17 +196,37 @@ impl InputSourcesHandler {
         if options.is_empty() && !changed {
             return Ok(());
         }
-        let cmd = xkb_options_command(&options);
+        let cmd = xkb_options_command(&options)?;
         info!("{cmd}");
         self.sway_connection().run_command(cmd)?;
         Ok(())
     }
 }
 
-/// The options are quoted because sway splits an unquoted command at
-/// commas and would run every option after the first as a command.
-fn xkb_options_command(options: &[String]) -> String {
-    format!("input type:keyboard xkb_options '{}'", options.join(","))
+/// Layouts, variants and options, alone or comma-joined, as the last
+/// argument of their command. They are quoted because sway splits an
+/// unquoted command at commas and would run every value after the first as
+/// a command.
+fn sway_layout_argument(value: &str) -> Result<String, Unquotable> {
+    sway_argument(value, '\'', true)
+}
+
+/// The command for GNOME's XKB options. An option sway can't receive intact
+/// is left out; if none is left, the options are cleared.
+fn xkb_options_command(options: &[String]) -> Result<String, Unquotable> {
+    let options: Vec<&str> = options
+        .iter()
+        .map(String::as_str)
+        .filter(|option| match sway_layout_argument(option) {
+            Ok(_) => true,
+            Err(e) => {
+                warn!("XKB option {option:?} left out: sway can't receive it, {e}");
+                false
+            }
+        })
+        .collect();
+    let options = sway_layout_argument(&options.join(","))?;
+    Ok(format!("input type:keyboard xkb_options {options}"))
 }
 
 impl InputHandler for InputSourcesHandler {
@@ -243,6 +278,24 @@ mod tests {
     }
 
     #[test]
+    fn sources_sway_cant_receive_are_left_out() {
+        let sources = vec![
+            ("xkb".into(), "us\nbad".into()),
+            ("xkb".into(), "de+bad\nvariant".into()),
+            ("xkb".into(), "fr+o'dd\\".into()),
+            ("xkb".into(), "jp".into()),
+        ];
+        let effective: Vec<(String, String)> = effective_sources(sources)
+            .into_iter()
+            .map(|e| (e.layout, e.variant))
+            .collect();
+        assert_eq!(
+            effective,
+            vec![("fr".into(), "o'dd\\".into()), ("jp".into(), "".into())]
+        );
+    }
+
+    #[test]
     fn ibus_engine_descriptions_are_parsed() {
         let xml = "<component><name>c</name><!-- <engine><name>x</name></engine> -->\
             <engines><engine><name>xkb:jp::jpn</name><layout>jp</layout></engine>\
@@ -262,11 +315,28 @@ mod tests {
     fn xkb_options_are_joined_and_quoted() {
         let options = ["compose:ralt".to_string(), "lv3:menu_switch".to_string()];
         assert_eq!(
-            xkb_options_command(&options),
+            xkb_options_command(&options).unwrap(),
             "input type:keyboard xkb_options 'compose:ralt,lv3:menu_switch'"
         );
         assert_eq!(
-            xkb_options_command(&[]),
+            xkb_options_command(&[]).unwrap(),
+            "input type:keyboard xkb_options ''"
+        );
+    }
+
+    #[test]
+    fn xkb_options_are_sent_intact() {
+        let options = [
+            "bad\noption".to_string(),
+            "it's;$x".to_string(),
+            "end\\".to_string(),
+        ];
+        assert_eq!(
+            xkb_options_command(&options).unwrap(),
+            "input type:keyboard xkb_options \"it's;$$x,end\"\\"
+        );
+        assert_eq!(
+            xkb_options_command(&options[..1]).unwrap(),
             "input type:keyboard xkb_options ''"
         );
     }
