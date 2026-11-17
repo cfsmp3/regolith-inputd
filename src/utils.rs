@@ -54,6 +54,14 @@ pub fn get_inputs_json() -> Fallible<Vec<serde_json::Value>> {
     CommandType::GetInputs.decode(receive_message(&mut stream)?)
 }
 
+/// sway's outputs, untyped, disabled ones included. swayipc's `Output`
+/// requires fields sway leaves out for some outputs.
+pub fn get_outputs_json() -> Fallible<Vec<serde_json::Value>> {
+    let mut stream: UnixStream = SwayConnection::new()?.into();
+    stream.write_all(&CommandType::GetOutputs.encode())?;
+    CommandType::GetOutputs.decode(receive_message(&mut stream)?)
+}
+
 /// The input devices swayipc's `Input` can describe; the others are left out.
 pub fn get_inputs() -> Fallible<Vec<Input>> {
     Ok(get_inputs_json()?
