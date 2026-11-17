@@ -120,6 +120,30 @@ fn unplugging_powering_off_or_reconfiguring_leave_the_panel_alone() {
 }
 
 #[test]
+fn a_laptop_panel_created_again_on_resume_starts_the_panel_again() {
+    let (sway, daemon, first) = start("im-resume");
+    sway.set_outputs(r#"[{"name": "eDP-1", "id": 3, "active": true, "power": true}]"#);
+    thread::sleep(SETTLE);
+    let started = daemon.panels_started().len();
+    // On resume sway destroys the panel's output and creates it again, under
+    // the same name and with a new ID, before the daemon reads the outputs.
+    sway.set_outputs(r#"[{"name": "eDP-1", "id": 9, "active": true, "power": true}]"#);
+    let panels = daemon.wait_for_panels(started + 1);
+    assert_ne!(*panels.last().unwrap(), first);
+    // A change that keeps its ID, such as a new scale, adds no global.
+    sway.set_outputs(
+        r#"[{"name": "eDP-1", "id": 9, "active": true, "power": true, "scale": 2.0}]"#,
+    );
+    thread::sleep(SETTLE);
+    assert_eq!(
+        daemon.panels_started().len(),
+        started + 1,
+        "{:?}",
+        daemon.ibus_log()
+    );
+}
+
+#[test]
 fn a_panel_that_dies_is_started_again() {
     let (_sway, daemon, first) = start("im-crash");
     let status = Command::new("kill")

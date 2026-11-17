@@ -32,8 +32,11 @@
 //! input method updates on every new Wayland global, a new `wl_output`
 //! included, and sway then drops every text they commit: typing stops while
 //! key bindings still work (ibus/ibus#2870, fixed in 1.5.35). A new panel
-//! starts counting afresh. Outputs going away add no global and are left
-//! alone.
+//! starts counting afresh. An output is told apart by its name and by the
+//! ID sway gives it when it is created, so that one destroyed and created
+//! again under the same name (a laptop's panel on resume) counts as new even
+//! when the daemon never saw it gone. Outputs going away add no global and
+//! are left alone.
 //!
 //! The source in use is the counted source (see
 //! [`crate::input_sources::effective_sources`]) at the keyboard's active
@@ -283,8 +286,8 @@ struct Supervisor {
     panel_delay: Duration,
     next_xim_start: Instant,
     xim_delay: Duration,
-    /// The names of sway's active outputs; `None` until first read.
-    active_outputs: Option<BTreeSet<String>>,
+    /// sway's active outputs; `None` until first read.
+    active_outputs: Option<BTreeSet<ActiveOutput>>,
     /// When to start the panel again, after outputs appeared.
     panel_restart: Option<Instant>,
     /// When to check next for panels this supervisor didn't start.
@@ -421,7 +424,10 @@ impl Supervisor {
             }
         };
         if let Some(known) = &self.active_outputs {
-            let new: Vec<&str> = active.difference(known).map(String::as_str).collect();
+            let new: Vec<&str> = active
+                .difference(known)
+                .map(|output| output.name.as_str())
+                .collect();
             if !new.is_empty() {
                 info!("Output turned on: {}", new.join(", "));
                 self.panel_restart = Some(Instant::now() + OUTPUT_SETTLE);
@@ -896,12 +902,25 @@ fn stop_other_panels() {
     }
 }
 
-/// The names of the active outputs: each has a `wl_output` global.
-fn active_outputs(outputs: &[Value]) -> BTreeSet<String> {
+/// An active output, which has a `wl_output` global. sway gives each output
+/// it creates a new ID, which it keeps while the output is turned off and on.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ActiveOutput {
+    name: String,
+    id: Option<u64>,
+}
+
+/// The active outputs.
+fn active_outputs(outputs: &[Value]) -> BTreeSet<ActiveOutput> {
     outputs
         .iter()
         .filter(|o| o["active"] == true)
-        .filter_map(|o| o["name"].as_str().map(String::from))
+        .filter_map(|o| {
+            Some(ActiveOutput {
+                name: o["name"].as_str()?.to_string(),
+                id: o["id"].as_u64(),
+            })
+        })
         .collect()
 }
 
@@ -1109,7 +1128,19 @@ mod tests {
             json!({"name": "HDMI-A-1", "active": true}),
             json!({"active": true}),
         ];
-        let names: Vec<String> = super::active_outputs(&outputs).into_iter().collect();
+        let names: Vec<String> = super::active_outputs(&outputs)
+            .into_iter()
+            .map(|o| o.name)
+            .collect();
         assert_eq!(names, ["HDMI-A-1", "eDP-1"]);
+    }
+
+    #[test]
+    fn an_output_created_again_under_its_name_is_a_new_output() {
+        let before = super::active_outputs(&[json!({"name": "eDP-1", "id": 3, "active": true})]);
+        let again = super::active_outputs(&[json!({"name": "eDP-1", "id": 9, "active": true})]);
+        let same = super::active_outputs(&[json!({"name": "eDP-1", "id": 3, "active": true})]);
+        assert_eq!(again.difference(&before).count(), 1);
+        assert_eq!(same.difference(&before).count(), 0);
     }
 }
