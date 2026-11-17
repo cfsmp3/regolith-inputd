@@ -1,3 +1,11 @@
+regolith-inputd (0.6.1) jammy; urgency=medium
+
+  [ rego-port-bot ]
+  * fix: make IBus opt-in and restart its Wayland panel on new outputs
+  * fix: start the IBus panel again for an output created again under its name
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Tue, 17 Nov 2026 08:23:29 -0800
+
 regolith-inputd (0.6.0) jammy; urgency=medium
 
   [ rego-port-bot ]
