@@ -136,13 +136,13 @@ impl State {
 }
 
 impl FakeSway {
-    fn start(socket: &Path, inputs: &'static str) -> FakeSway {
+    fn start(socket: &Path, inputs: &str, outputs: &str) -> FakeSway {
         let listener = UnixListener::bind(socket).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let subscribed = Arc::new(Mutex::new(false));
         let state = Arc::new(Mutex::new(State {
             inputs: serde_json::from_str(inputs).unwrap(),
-            outputs: serde_json::from_str(OUTPUTS).unwrap(),
+            outputs: serde_json::from_str(outputs).unwrap(),
             subscribers: Vec::new(),
             tree_requests: 0,
             output_requests: 0,
@@ -201,6 +201,41 @@ impl FakeSway {
             .lock()
             .unwrap()
             .emit(WINDOW_EVENT, "window", &event);
+    }
+
+    /// Plug in `device` (its GET_INPUTS object): sway lists it and sends an
+    /// input event with change `added`.
+    pub fn add_input(&self, device: Value) {
+        let mut state = self.state.lock().unwrap();
+        state.inputs.as_array_mut().unwrap().push(device.clone());
+        let event = json!({"change": "added", "input": device}).to_string();
+        state.emit(INPUT_EVENT, "input", &event);
+    }
+
+    /// The commands sway got, each command of a command list on its own.
+    pub fn single_commands(&self) -> Vec<String> {
+        self.commands()
+            .iter()
+            .flat_map(|list| list.split("; ").map(String::from).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// Wait until sway has got `command`, alone or in a command list, after
+    /// the first `skip` messages. Returns whether it did within 10 s.
+    pub fn wait_for_command(&self, skip: usize, command: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self
+                .commands()
+                .iter()
+                .skip(skip)
+                .any(|list| list.split("; ").any(|c| c == command))
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 
     /// The first keyboard's layouts and the index of the active one.
@@ -469,25 +504,33 @@ impl Daemon {
     }
 
     /// Like `start`, with sway reporting `inputs` (GET_INPUTS JSON).
-    pub fn start_with_inputs(
+    pub fn start_with_inputs(name: &str, keyfile: &str, inputs: &str) -> (FakeSway, Daemon) {
+        Daemon::start_with_devices(name, keyfile, inputs, OUTPUTS)
+    }
+
+    /// Like `start`, with sway reporting `inputs` (GET_INPUTS JSON) and
+    /// `outputs` (GET_OUTPUTS JSON).
+    pub fn start_with_devices(
         name: &str,
         keyfile: &str,
-        inputs: &'static str,
+        inputs: &str,
+        outputs: &str,
     ) -> (FakeSway, Daemon) {
-        Daemon::spawn(name, keyfile, inputs, None)
+        Daemon::spawn(name, keyfile, inputs, outputs, None)
     }
 
     /// Like `start`, in a Wayland session with stand-in IBus programs in
     /// `PATH` and a private bus for them, so that the session's own IBus,
     /// if any, is left alone.
     pub fn start_with_ibus(name: &str, keyfile: &str, ibus: Ibus) -> (FakeSway, Daemon) {
-        Daemon::spawn(name, keyfile, INPUTS, Some(ibus))
+        Daemon::spawn(name, keyfile, INPUTS, OUTPUTS, Some(ibus))
     }
 
     fn spawn(
         name: &str,
         keyfile: &str,
-        inputs: &'static str,
+        inputs: &str,
+        outputs: &str,
         ibus: Option<Ibus>,
     ) -> (FakeSway, Daemon) {
         let dir = std::env::temp_dir().join(format!("inputd-test-{}-{name}", std::process::id()));
@@ -497,7 +540,7 @@ impl Daemon {
         fs::write(settings_dir.join("keyfile"), keyfile).unwrap();
 
         let socket = dir.join("sway.sock");
-        let sway = FakeSway::start(&socket, inputs);
+        let sway = FakeSway::start(&socket, inputs, outputs);
         let mut command = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"));
         command
             .env("SWAYSOCK", &socket)
