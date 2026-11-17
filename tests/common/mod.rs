@@ -17,9 +17,11 @@ use std::time::{Duration, Instant};
 const MAGIC: &[u8; 6] = b"i3-ipc";
 const RUN_COMMAND: u32 = 0;
 const SUBSCRIBE: u32 = 2;
+const GET_OUTPUTS: u32 = 3;
 const GET_TREE: u32 = 4;
 const SEND_TICK: u32 = 10;
 const GET_INPUTS: u32 = 100;
+const OUTPUT_EVENT: u32 = 0x8000_0001;
 const WINDOW_EVENT: u32 = 0x8000_0003;
 const TICK_EVENT: u32 = 0x8000_0007;
 const INPUT_EVENT: u32 = 0x8000_0015;
@@ -40,6 +42,9 @@ const INPUTS: &str = r#"[
                 "scroll_method": "two_finger", "dwt": "enabled"}}
 ]"#;
 
+/// What sway reports for the outputs: a laptop's panel.
+const OUTPUTS: &str = r#"[{"name": "eDP-1", "active": true, "power": true}]"#;
+
 /// A minimal sway IPC server that records every command it is asked to run.
 ///
 /// It keeps the keyboards' layouts as sway does: `xkb_layout`,
@@ -55,10 +60,13 @@ pub struct FakeSway {
 
 struct State {
     inputs: Value,
+    outputs: Value,
     /// Subscribed clients, with the events they subscribed to.
     subscribers: Vec<(UnixStream, Vec<String>)>,
     /// How many times a client asked for the tree.
     tree_requests: usize,
+    /// How many times a client asked for the outputs.
+    output_requests: usize,
 }
 
 impl State {
@@ -134,8 +142,10 @@ impl FakeSway {
         let subscribed = Arc::new(Mutex::new(false));
         let state = Arc::new(Mutex::new(State {
             inputs: serde_json::from_str(inputs).unwrap(),
+            outputs: serde_json::from_str(OUTPUTS).unwrap(),
             subscribers: Vec::new(),
             tree_requests: 0,
+            output_requests: 0,
         }));
         let (recorded, flag, shared) = (commands.clone(), subscribed.clone(), state.clone());
         thread::spawn(move || {
@@ -159,6 +169,15 @@ impl FakeSway {
         let mut state = self.state.lock().unwrap();
         assert!(!state.subscribers.is_empty(), "daemon has not subscribed");
         state.emit(TICK_EVENT, "tick", &event);
+    }
+
+    /// Change the outputs to `outputs` (GET_OUTPUTS JSON), as plugging,
+    /// unplugging or configuring a monitor does, and send the output event
+    /// sway sends for it.
+    pub fn set_outputs(&self, outputs: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.outputs = serde_json::from_str(outputs).unwrap();
+        state.emit(OUTPUT_EVENT, "output", r#"{"change": "unspecified"}"#);
     }
 
     /// Switch the keyboards' layout the way the user's key binding does:
@@ -233,6 +252,15 @@ impl FakeSway {
         let deadline = Instant::now() + Duration::from_secs(10);
         while self.state.lock().unwrap().tree_requests == 0 {
             assert!(Instant::now() < deadline, "no client asked for the tree");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Wait until a client has asked for the outputs.
+    pub fn wait_for_get_outputs(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.state.lock().unwrap().output_requests == 0 {
+            assert!(Instant::now() < deadline, "no client asked for the outputs");
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -318,6 +346,10 @@ fn serve(
                 "[]".to_string()
             }
             GET_INPUTS => state.inputs.to_string(),
+            GET_OUTPUTS => {
+                state.output_requests += 1;
+                state.outputs.to_string()
+            }
             _ => "[]".to_string(),
         };
         if stream.write_all(&message(kind, &reply)).is_err() {
@@ -339,15 +371,90 @@ fn message(kind: u32, payload: &str) -> Vec<u8> {
 pub struct Daemon {
     child: Child,
     dir: PathBuf,
+    /// The private D-Bus daemon standing in for IBus's bus and the session
+    /// bus, if any.
+    bus: Option<Child>,
+    /// The resources the stand-in trawld was asked for, in order.
+    trawl_calls: Arc<Mutex<Vec<String>>>,
+    /// The Wayland display the daemon is told it runs on.
+    wayland_display: String,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(bus) = &mut self.bus {
+            let _ = bus.kill();
+            let _ = bus.wait();
+        }
+        // The stand-in IBus programs exit once their directory is gone.
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
+
+/// What trawld knows of the resource `regolith.experimental.ibus`.
+#[derive(Default)]
+pub enum Trawl {
+    /// The resource isn't set: trawld answers with an empty value.
+    #[default]
+    Unset,
+    /// The resource is set to this value.
+    Value(&'static str),
+    /// trawld answers with an error.
+    Fails,
+    /// No trawld runs on the session bus.
+    Missing,
+}
+
+/// How the stand-in IBus is set up for a test.
+#[derive(Default)]
+pub struct Ibus {
+    /// What trawld answers when the daemon asks for the resource.
+    pub trawl: Trawl,
+    /// Whether a Wayland panel the daemon didn't start already runs, as
+    /// one an earlier version of the daemon left does.
+    pub foreign_panel: bool,
+    /// The arguments of an `ibus-daemon` the daemon didn't start that
+    /// already serves the session, if any.
+    pub foreign_daemon: Option<&'static str>,
+}
+
+impl Ibus {
+    /// A user who opted in to IBus.
+    pub fn opted_in() -> Ibus {
+        Ibus {
+            trawl: Trawl::Value("true"),
+            ..Ibus::default()
+        }
+    }
+}
+
+/// The stand-in IBus programs. Each logs its start, with its arguments, to
+/// `ibus.log`, and runs until it is stopped or the test's directory goes.
+/// `ibus address` gives the private bus's address once `ibus-daemon` runs;
+/// `ibus-daemon --replace` stops the one running first. A panel started
+/// with `FOREIGN` set logs itself as a foreign panel.
+const FAKE_IBUS: [(&str, &str); 4] = [
+    (
+        "ibus-daemon",
+        "echo \"daemon $$ $*\" >>\"$D/ibus.log\"\n\
+         case \" $* \" in *' --replace '*) [ -f \"$D/daemon.pid\" ] && kill \"$(cat \"$D/daemon.pid\")\" 2>/dev/null\n\
+         for _ in $(seq 50); do [ -e \"$D/address\" ] || break; sleep 0.05; done;; esac\n\
+         echo $$ >\"$D/daemon.pid\"; cp \"$D/bus-address\" \"$D/address\"\n\
+         trap 'echo \"stopped $$\" >>\"$D/ibus.log\"; rm -f \"$D/address\"; exit 0' TERM\n",
+    ),
+    (
+        "ibus",
+        "[ \"$1\" = address ] || exit 1\ncat \"$D/address\" 2>/dev/null || echo '(null)'\nexit 0\n",
+    ),
+    (
+        "ibus-ui-gtk3",
+        "echo \"${FOREIGN:+foreign }panel $$ $*\" >>\"$D/ibus.log\"\n\
+         trap 'echo \"stopped $$\" >>\"$D/ibus.log\"; exit 0' TERM\n",
+    ),
+    ("ibus-x11", "echo \"xim $$ $*\" >>\"$D/ibus.log\"\n"),
+];
 
 impl Daemon {
     /// Whether the daemon process is still running.
@@ -367,6 +474,22 @@ impl Daemon {
         keyfile: &str,
         inputs: &'static str,
     ) -> (FakeSway, Daemon) {
+        Daemon::spawn(name, keyfile, inputs, None)
+    }
+
+    /// Like `start`, in a Wayland session with stand-in IBus programs in
+    /// `PATH` and a private bus for them, so that the session's own IBus,
+    /// if any, is left alone.
+    pub fn start_with_ibus(name: &str, keyfile: &str, ibus: Ibus) -> (FakeSway, Daemon) {
+        Daemon::spawn(name, keyfile, INPUTS, Some(ibus))
+    }
+
+    fn spawn(
+        name: &str,
+        keyfile: &str,
+        inputs: &'static str,
+        ibus: Option<Ibus>,
+    ) -> (FakeSway, Daemon) {
         let dir = std::env::temp_dir().join(format!("inputd-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let settings_dir = dir.join("config/glib-2.0/settings");
@@ -375,18 +498,123 @@ impl Daemon {
 
         let socket = dir.join("sway.sock");
         let sway = FakeSway::start(&socket, inputs);
-        let child = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"))
-            // Without a Wayland display the daemon starts no input method, so
-            // tests run from a desktop session leave its IBus alone.
-            .env_remove("WAYLAND_DISPLAY")
+        let mut command = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"));
+        command
             .env("SWAYSOCK", &socket)
             .env("GSETTINGS_BACKEND", "keyfile")
             .env("XDG_CONFIG_HOME", dir.join("config"))
             .env("IBUS_COMPONENT_PATH", dir.join("ibus"))
             .env("RUST_LOG", "info")
+            .env_remove("DISPLAY");
+        let trawl_calls = Arc::new(Mutex::new(Vec::new()));
+        let bus = match ibus {
+            // Without a Wayland display the daemon starts no input method, so
+            // tests run from a desktop session leave its IBus alone.
+            None => {
+                command.env_remove("WAYLAND_DISPLAY");
+                None
+            }
+            Some(ibus) => Some(fake_ibus(&dir, name, ibus, &trawl_calls, &mut command)),
+        };
+        let child = command.spawn().unwrap();
+        let daemon = Daemon {
+            child,
+            dir,
+            bus,
+            trawl_calls,
+            wayland_display: test_display(name),
+        };
+        (sway, daemon)
+    }
+
+    /// The resources the daemon asked trawld for, in order.
+    pub fn trawl_calls(&self) -> Vec<String> {
+        self.trawl_calls.lock().unwrap().clone()
+    }
+
+    /// Wait until the daemon asked trawld for a resource.
+    pub fn wait_for_trawl(&self) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let calls = self.trawl_calls();
+            if !calls.is_empty() {
+                return calls;
+            }
+            assert!(Instant::now() < deadline, "the daemon did not ask trawld");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// What the stand-in IBus programs logged, one line per event.
+    pub fn ibus_log(&self) -> Vec<String> {
+        fs::read_to_string(self.dir.join("ibus.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    /// The process IDs of the Wayland panels started so far, in order.
+    pub fn panels_started(&self) -> Vec<u32> {
+        self.ibus_log()
+            .iter()
+            .filter_map(|line| line.strip_prefix("panel "))
+            .map(|rest| {
+                assert!(
+                    rest.ends_with(" --enable-wayland-im"),
+                    "panel started without the Wayland input method: {rest}"
+                );
+                rest.split(' ').next().unwrap().parse().unwrap()
+            })
+            .collect()
+    }
+
+    /// The process IDs of the programs that were asked to stop, in order.
+    pub fn stopped(&self) -> Vec<u32> {
+        self.ibus_log()
+            .iter()
+            .filter_map(|line| line.strip_prefix("stopped "))
+            .map(|pid| pid.parse().unwrap())
+            .collect()
+    }
+
+    /// Start a Wayland panel on the daemon's display, as `ibus restart` or
+    /// the user does, with `args`; returns its process ID once it runs.
+    pub fn start_foreign_panel(&self, args: &[&str]) -> u32 {
+        let mut panel = Command::new(self.dir.join("ibus-bin/ibus-ui-gtk3"))
+            .args(args)
+            .env("FOREIGN", "1")
+            .env("WAYLAND_DISPLAY", &self.wayland_display)
             .spawn()
             .unwrap();
-        (sway, Daemon { child, dir })
+        let pid = panel.id();
+        // Reaped once the daemon stops it.
+        thread::spawn(move || panel.wait());
+        let started = format!("foreign panel {pid}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.ibus_log().iter().any(|l| l.starts_with(&started)) {
+            assert!(Instant::now() < deadline, "the foreign panel did not start");
+            thread::sleep(Duration::from_millis(20));
+        }
+        pid
+    }
+
+    /// Wait until `n` Wayland panels were started, and return their IDs.
+    pub fn wait_for_panels(&self, n: usize) -> Vec<u32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let panels = self.panels_started();
+            if panels.len() >= n {
+                return panels;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} panels started, expected {n}; IBus log: {:?}",
+                panels.len(),
+                self.ibus_log()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Install an IBus component description, as an input method package
@@ -420,6 +648,209 @@ impl Daemon {
             .unwrap();
         assert!(status.success(), "gsettings set {schema} {key} {value}");
     }
+}
+
+/// Write the stand-in IBus programs into `dir`, start the private bus with a
+/// stand-in trawld on it, and set up `command` to run the daemon with them.
+/// Returns the bus process.
+fn fake_ibus(
+    dir: &Path,
+    name: &str,
+    ibus: Ibus,
+    trawl_calls: &Arc<Mutex<Vec<String>>>,
+    command: &mut Command,
+) -> Child {
+    use std::io::BufRead;
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = dir.join("ibus-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let quoted = format!("'{}'", dir.display());
+    // The stand-ins find the tools they use even when the daemon runs
+    // without them in its PATH.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let tools = format!("'{}'", path.to_string_lossy());
+    for (program, body) in FAKE_IBUS {
+        let body = match program {
+            "ibus" => body.to_string(),
+            _ => format!("{body}while [ -d \"$D\" ]; do sleep 0.1; done\n"),
+        };
+        let path = bin.join(program);
+        fs::write(
+            &path,
+            format!("#!/bin/sh\nD={quoted}\nPATH={tools}\n{body}"),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let config = dir.join("bus.conf");
+    fs::write(
+        &config,
+        format!(
+            "<busconfig><type>session</type><listen>unix:path={}</listen>\
+             <auth>EXTERNAL</auth><policy context=\"default\">\
+             <allow send_destination=\"*\" eavesdrop=\"true\"/><allow eavesdrop=\"true\"/>\
+             <allow own=\"*\"/></policy></busconfig>",
+            dir.join("bus").display()
+        ),
+    )
+    .unwrap();
+    let mut bus = Command::new("dbus-daemon")
+        .arg(format!("--config-file={}", config.display()))
+        .args(["--nofork", "--print-address=1"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("dbus-daemon is needed to stand in for IBus's bus");
+    let mut address = String::new();
+    std::io::BufReader::new(bus.stdout.take().unwrap())
+        .read_line(&mut address)
+        .unwrap();
+    let address = address.trim();
+    fs::write(dir.join("bus-address"), address).unwrap();
+    if !matches!(ibus.trawl, Trawl::Missing) {
+        fake_trawld(address, ibus.trawl, trawl_calls.clone());
+    }
+
+    let mut dirs = vec![bin.clone()];
+    dirs.extend(std::env::split_paths(&path));
+    let wayland_display = test_display(name);
+    if let Some(args) = ibus.foreign_daemon {
+        let mut daemon = Command::new(bin.join("ibus-daemon"))
+            .args(args.split_whitespace())
+            .env("WAYLAND_DISPLAY", &wayland_display)
+            .spawn()
+            .unwrap();
+        // Reaped once it is replaced.
+        thread::spawn(move || daemon.wait());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.join("address").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the foreign ibus-daemon did not start"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    if ibus.foreign_panel {
+        let mut panel = Command::new(bin.join("ibus-ui-gtk3"))
+            .arg("--enable-wayland-im")
+            .env("WAYLAND_DISPLAY", &wayland_display)
+            .spawn()
+            .unwrap();
+        // Reaped once the daemon stops it.
+        thread::spawn(move || panel.wait());
+        let log = dir.join("ibus.log");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fs::read_to_string(&log).is_ok_and(|l| l.starts_with("panel ")) {
+            assert!(Instant::now() < deadline, "the foreign panel did not start");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    command
+        .env("PATH", std::env::join_paths(dirs).unwrap())
+        // The private bus is the daemon's session bus too, so that a trawld
+        // of the session running the tests can't answer.
+        .env("DBUS_SESSION_BUS_ADDRESS", address)
+        // No such display exists: the stand-ins don't need one, and the
+        // daemon stops only panels on its own display.
+        .env("WAYLAND_DISPLAY", wayland_display);
+    bus
+}
+
+/// The Wayland display a test's daemon is told it runs on. No such display
+/// exists: the stand-ins don't need one.
+fn test_display(name: &str) -> String {
+    format!("inputd-test-{}-{name}", std::process::id())
+}
+
+/// The part of trawld's D-Bus interface the daemon uses.
+const TRAWL_INTERFACE: &str = r#"<node>
+  <interface name="org.regolith.trawl1">
+    <method name="GetResource">
+      <arg name="key" type="s" direction="in"/>
+      <arg name="value" type="s" direction="out"/>
+    </method>
+  </interface>
+</node>"#;
+
+/// Serve `org.regolith.Trawl` on the bus at `address` until the bus goes,
+/// answering `GetResource` for `regolith.experimental.ibus` as `trawl` says
+/// and any other resource as unset, as trawld does, and logging each
+/// resource asked for to `calls`. Returns once the name is owned.
+fn fake_trawld(address: &str, trawl: Trawl, calls: Arc<Mutex<Vec<String>>>) {
+    use gio::{Cancellable, DBusCallFlags, DBusConnection, DBusConnectionFlags, DBusNodeInfo};
+    use glib::ToVariant;
+
+    let address = address.to_string();
+    let (ready, started) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let connection = DBusConnection::for_address_sync(
+                    &address,
+                    DBusConnectionFlags::AUTHENTICATION_CLIENT
+                        | DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+                    None,
+                    Cancellable::NONE,
+                )
+                .expect("the stand-in trawld cannot connect to the bus");
+                let node = DBusNodeInfo::for_xml(TRAWL_INTERFACE).unwrap();
+                let interface = node.lookup_interface("org.regolith.trawl1").unwrap();
+                connection
+                    .register_object(
+                        "/org/regolith/Trawl",
+                        &interface,
+                        move |_, _, _, _, method, parameters, invocation| {
+                            let Some((key,)) = parameters.get::<(String,)>() else {
+                                invocation.return_dbus_error(
+                                    "org.freedesktop.DBus.Error.InvalidArgs",
+                                    method,
+                                );
+                                return;
+                            };
+                            calls.lock().unwrap().push(key.clone());
+                            let value = match &trawl {
+                                _ if key != "regolith.experimental.ibus" => "",
+                                Trawl::Value(value) => value,
+                                Trawl::Fails => {
+                                    invocation.return_dbus_error(
+                                        "org.freedesktop.DBus.Error.Failed",
+                                        "the resources cannot be read",
+                                    );
+                                    return;
+                                }
+                                _ => "",
+                            };
+                            invocation.return_value(Some(&(value,).to_variant()));
+                        },
+                        |_, _, _, _, _| unreachable!("trawld has no properties"),
+                        |_, _, _, _, _, _| false,
+                    )
+                    .unwrap();
+                // DBUS_NAME_FLAG_DO_NOT_QUEUE: the bus is the test's own.
+                connection
+                    .call_sync(
+                        Some("org.freedesktop.DBus"),
+                        "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus",
+                        "RequestName",
+                        Some(&("org.regolith.Trawl", 4u32).to_variant()),
+                        None,
+                        DBusCallFlags::NONE,
+                        -1,
+                        Cancellable::NONE,
+                    )
+                    .expect("the stand-in trawld cannot own its name");
+                let main_loop = glib::MainLoop::new(Some(&context), false);
+                let quit = main_loop.clone();
+                connection.connect_closed(move |_, _, _| quit.quit());
+                ready.send(()).unwrap();
+                main_loop.run();
+            })
+            .unwrap();
+    });
+    started.recv().expect("the stand-in trawld did not start");
 }
 
 /// Whether the installed GSettings schema `schema` has `key`. Keys are added

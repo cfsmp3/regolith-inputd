@@ -372,6 +372,7 @@ version = "0.6.0"
 dependencies = [
  "gio",
  "glib",
+ "libc",
  "log",
  "pretty_env_logger",
  "serde",
