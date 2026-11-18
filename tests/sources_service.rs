@@ -263,6 +263,63 @@ fn activate_switches_as_a_user_does() {
 }
 
 #[test]
+fn activate_selects_the_entry_of_a_repeated_source() {
+    let (_bus, sway, daemon, client) = start(
+        "service-repeated",
+        &keyfile(
+            "[('xkb', 'us'), ('other', 'x'), ('xkb', 'de'), ('xkb', 'us')]",
+            "",
+        ),
+    );
+    sway.wait_for_layout(&["us", "de", "us"], 0);
+    wait_for_current(&daemon, "uint32 0");
+    client.pump(Duration::from_millis(300));
+
+    // The second us, at position 3, is layout 2: it is selected, not the
+    // first us again. The history names the source once.
+    let seen = client.changed.get();
+    client.activate(3).unwrap();
+    assert_eq!(
+        daemon.gsettings_get(SOURCES, "mru-sources"),
+        "[('xkb', 'us'), ('xkb', 'de')]"
+    );
+    assert_eq!(daemon.gsettings_get(SOURCES, "current"), "uint32 3");
+    let (list, current) = client.sources();
+    assert_eq!(
+        list,
+        vec![
+            (0, "en\u{2081}".into(), "English (US)".into(), false),
+            (2, "de".into(), "German".into(), false),
+            (3, "en\u{2082}".into(), "English (US)".into(), true),
+        ]
+    );
+    assert_eq!(text(&current, "icon-text"), "en\u{2082}");
+    assert_eq!(text(&current, "layout"), "us");
+    sway.wait_for_layout(&["us", "de", "us"], 2);
+    client.wait_changed(seen);
+
+    // Activating it again changes nothing.
+    client.pump(Duration::from_millis(300));
+    let seen = client.changed.get();
+    let commands = sway.commands().len();
+    client.activate(3).unwrap();
+    client.pump(Duration::from_millis(500));
+    assert_eq!(client.changed.get(), seen);
+    assert_eq!(sway.commands().len(), commands);
+
+    // The first us is another entry of the same source: a change.
+    client.activate(0).unwrap();
+    assert_eq!(daemon.gsettings_get(SOURCES, "current"), "uint32 0");
+    assert_eq!(client.marked(), Some(0));
+    assert_eq!(
+        daemon.gsettings_get(SOURCES, "mru-sources"),
+        "[('xkb', 'us'), ('xkb', 'de')]"
+    );
+    sway.wait_for_layout(&["us", "de", "us"], 0);
+    client.wait_changed(seen);
+}
+
+#[test]
 fn user_switches_and_list_edits_are_announced() {
     let (_bus, sway, daemon, client) = start(
         "service-follow",

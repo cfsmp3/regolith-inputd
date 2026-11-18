@@ -41,13 +41,10 @@ const FENCE: &str = "regolith-inputd:sources:";
 /// sway's input event type, without the event bit.
 const INPUT_EVENT: u32 = 21;
 
+/// A source's identity: its type and id, as in the `sources` setting. The
+/// list may repeat one; each occurrence is then an entry of its own,
+/// selected by its layout index.
 type Source = (String, String);
-
-/// One entry of the source list: a source and which of its occurrences in
-/// the list it is, counting from zero. A source listed once is always its
-/// occurrence 0, so repeated sources stay distinct entries while list edits
-/// keep following each source.
-type Slot = (Source, usize);
 
 /// An input device as sway describes it. Decoded leniently: keyboards
 /// without vendor/product ids (virtual keyboards, the wlroots X11/Wayland
@@ -89,12 +86,14 @@ struct Switcher {
     listed: Vec<EffectiveSource>,
     /// Their identities.
     sources: Vec<Source>,
-    /// Listed entries that were chosen or made current, most recent first.
-    /// The never-chosen ones are not in it.
-    recent: Vec<Slot>,
-    current: Option<Slot>,
+    /// Listed sources that were chosen or made current, most recent first,
+    /// once each. The never-chosen ones are not in it.
+    recent: Vec<Source>,
+    /// The layout index of the current entry.
+    current: Option<usize>,
     per_window: bool,
-    windows: HashMap<i64, Slot>,
+    /// The layout index of each window's entry.
+    windows: HashMap<i64, usize>,
     focused: Option<i64>,
     keyboards: HashMap<String, Keyboard>,
     fence_sent: u64,
@@ -167,75 +166,39 @@ impl Switcher {
         self.sources = self.listed.iter().map(|e| e.source.clone()).collect();
     }
 
-    /// The entry at layout index `i`.
-    fn slot_at(&self, i: usize) -> Slot {
-        let s = self.sources[i].clone();
-        let n = self.sources[..i].iter().filter(|x| **x == s).count();
-        (s, n)
+    /// The layout index of a source's first entry.
+    fn index_of(&self, s: &Source) -> Option<usize> {
+        self.sources.iter().position(|x| x == s)
     }
 
-    /// The layout index of an entry: its occurrence of the source, or the
-    /// source's first occurrence when the list no longer repeats it that
-    /// often.
-    fn index_of(&self, (s, n): &Slot) -> Option<usize> {
-        let mut found = self
-            .sources
-            .iter()
-            .enumerate()
-            .filter(|(_, x)| *x == s)
-            .map(|(i, _)| i);
-        let first = found.next()?;
-        Some(if *n == 0 {
-            first
-        } else {
-            found.nth(n - 1).unwrap_or(first)
-        })
-    }
-
-    fn current_index(&self) -> Option<usize> {
-        self.current.as_ref().and_then(|c| self.index_of(c))
-    }
-
-    /// Keep only the listed entries of `history`, once each, in order.
-    fn set_recent(&mut self, history: Vec<Slot>) {
-        let mut seen: Vec<usize> = Vec::new();
-        for i in history.iter().filter_map(|s| self.index_of(s)) {
-            if !seen.contains(&i) {
-                seen.push(i);
+    /// Keep only the listed sources of `history`, once each, in order.
+    fn set_recent(&mut self, history: Vec<Source>) {
+        let mut recent: Vec<Source> = Vec::new();
+        for s in history {
+            if self.sources.contains(&s) && !recent.contains(&s) {
+                recent.push(s);
             }
         }
-        self.recent = seen.into_iter().map(|i| self.slot_at(i)).collect();
+        self.recent = recent;
     }
 
-    /// The entries a stored `mru-sources` value names: a source's first
-    /// appearance there is its first occurrence, the next one its second,
-    /// and so on.
-    fn slots_of(history: Vec<Source>) -> Vec<Slot> {
-        let mut slots: Vec<Slot> = Vec::new();
-        for s in history {
-            let n = slots.iter().filter(|(x, _)| *x == s).count();
-            slots.push((s, n));
-        }
-        slots
-    }
-
-    /// The value `mru-sources` gets: every listed entry, the most recently
-    /// chosen first, then the never-chosen ones in list order.
+    /// The value `mru-sources` gets: every listed source once, the most
+    /// recently chosen first, then the never-chosen ones in list order.
     fn history(&self) -> Vec<Source> {
         let mut h = self.recent.clone();
-        h.extend(
-            (0..self.sources.len())
-                .map(|i| self.slot_at(i))
-                .filter(|s| !self.recent.contains(s)),
-        );
-        h.into_iter().map(|(s, _)| s).collect()
+        for s in &self.sources {
+            if !h.contains(s) {
+                h.push(s.clone());
+            }
+        }
+        h
     }
 
     fn startup(&mut self) {
         self.read_sources();
         self.per_window = self.settings.boolean("per-window");
         let saved: Vec<Source> = self.settings.get::<Vec<Source>>("mru-sources");
-        self.set_recent(Self::slots_of(saved));
+        self.set_recent(saved);
         self.refresh_keyboards();
         self.focused = self.query_focused();
         let first = match self.recent.first() {
@@ -318,15 +281,15 @@ impl Switcher {
         self.send_fence();
     }
 
-    /// Make the entry at layout index `index` the current one.
+    /// Make the entry at layout index `index` the current one. Its source
+    /// becomes the most recent, even when another entry of it was current.
     fn activate(&mut self, index: usize, interactive: bool) {
-        if index >= self.sources.len() {
+        let Some(s) = self.sources.get(index).cloned() else {
             return;
-        }
-        let s = self.slot_at(index);
-        self.current = Some(s.clone());
+        };
+        self.current = Some(index);
         self.recent.retain(|x| x != &s);
-        self.recent.insert(0, s.clone());
+        self.recent.insert(0, s);
         if interactive {
             let v = self.history().to_variant();
             if let Err(e) = self.settings.set_value("mru-sources", &v) {
@@ -335,7 +298,7 @@ impl Switcher {
         }
         if self.per_window {
             if let Some(w) = self.focused {
-                self.windows.insert(w, s);
+                self.windows.insert(w, index);
             }
         }
         self.switch_all(index);
@@ -343,33 +306,41 @@ impl Switcher {
 
     /// The layout index of the entry a window had, or the first entry.
     fn window_source(&self, id: i64) -> Option<usize> {
-        match self.windows.get(&id).and_then(|s| self.index_of(s)) {
-            Some(i) => Some(i),
+        match self.windows.get(&id) {
+            Some(&i) => Some(i),
             None => (!self.sources.is_empty()).then_some(0),
         }
     }
 
     fn reassert(&mut self) {
-        if let Some(i) = self.current_index() {
+        if let Some(i) = self.current {
             self.switch_all(i);
         }
     }
 
+    /// Follow an edit of the source list. As in GNOME Shell, the current
+    /// entry and the windows' entries follow their source to its first
+    /// entry in the new list; a window whose source is gone gets the first
+    /// entry when it is focused again.
     fn sources_changed(&mut self) {
+        let old = std::mem::take(&mut self.sources);
+        let current = self.current.take().and_then(|i| old.get(i).cloned());
         self.read_sources();
+        let windows = std::mem::take(&mut self.windows);
+        for (w, i) in windows {
+            if let Some(i) = old.get(i).and_then(|s| self.index_of(s)) {
+                self.windows.insert(w, i);
+            }
+        }
         let history = std::mem::take(&mut self.recent);
         self.set_recent(history);
-        let keep = self.current_index();
+        let keep = current.and_then(|s| self.index_of(&s));
         let fallback = || match self.recent.first() {
             Some(s) => self.index_of(s),
             None => (!self.sources.is_empty()).then_some(0),
         };
-        match keep.or_else(fallback) {
-            Some(i) => {
-                self.current = None;
-                self.activate(i, false);
-            }
-            None => self.current = None,
+        if let Some(i) = keep.or_else(fallback) {
+            self.activate(i, false);
         }
         // The keymap event (or the fence) re-asserts once sway has the new list.
         self.send_fence();
@@ -384,7 +355,7 @@ impl Switcher {
     /// When the current entry's position or its source changes, `current`
     /// follows it.
     fn publish(&mut self) {
-        let current = self.current_index();
+        let current = self.current;
         let active = current.map(|i| (self.listed[i].position, self.sources[i].clone()));
         if active != self.published_current {
             if let Some((position, _)) = &active {
@@ -430,7 +401,7 @@ impl Switcher {
                     sources_service::refuse_index(invocation, position);
                     return None;
                 };
-                if self.current_index() == Some(i) {
+                if self.current == Some(i) {
                     invocation.return_value(None);
                     return None;
                 }
@@ -507,7 +478,7 @@ impl Switcher {
                     return;
                 }
                 let index = index as usize;
-                if self.current_index() != Some(index) {
+                if self.current != Some(index) {
                     if let Some(s) = self.sources.get(index) {
                         info!("User switched to {s:?} at layout {index}");
                         self.activate(index, true);

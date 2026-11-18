@@ -190,3 +190,133 @@ fn without_per_window_the_source_is_global() {
     sway.window_event("focus", 2);
     assert_stays(&sway, &["us", "de"], 1);
 }
+
+/// Wait until `current` is `expected`.
+fn wait_for_current(daemon: &Daemon, expected: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let current = daemon.gsettings_get(SOURCES, "current");
+        if current == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "current is {current}, expected {expected}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_repeated_source_is_one_entry_per_occurrence_and_once_in_the_history() {
+    let (sway, daemon) = start(
+        "dup-switch",
+        &keyfile("[('xkb', 'us'), ('xkb', 'de'), ('xkb', 'us')]", ""),
+    );
+    sway.wait_for_layout(&["us", "de", "us"], 0);
+    wait_for_current(&daemon, "uint32 0");
+    // The second us is an entry of its own, not the first one again.
+    sway.user_switch(2);
+    wait_for_current(&daemon, "uint32 2");
+    wait_for_mru(&daemon, "[('xkb', 'us'), ('xkb', 'de')]");
+    assert_stays(&sway, &["us", "de", "us"], 2);
+    // Back to the first us: a change of entry, with the same history.
+    sway.user_switch(0);
+    wait_for_current(&daemon, "uint32 0");
+    assert_stays(&sway, &["us", "de", "us"], 0);
+    assert_eq!(
+        daemon.gsettings_get(SOURCES, "mru-sources"),
+        "[('xkb', 'us'), ('xkb', 'de')]"
+    );
+}
+
+#[test]
+fn startup_takes_the_first_entry_of_the_most_recent_source() {
+    let (sway, daemon) = start(
+        "dup-startup",
+        &keyfile(
+            "[('xkb', 'us'), ('xkb', 'de'), ('xkb', 'fr'), ('xkb', 'de')]",
+            "mru-sources=[('xkb', 'de'), ('xkb', 'us'), ('xkb', 'de')]\n",
+        ),
+    );
+    sway.wait_for_layout(&["us", "de", "fr", "de"], 1);
+    wait_for_current(&daemon, "uint32 1");
+    assert_stays(&sway, &["us", "de", "fr", "de"], 1);
+    assert_eq!(
+        daemon.gsettings_get(SOURCES, "mru-sources"),
+        "[('xkb', 'de'), ('xkb', 'us'), ('xkb', 'de')]"
+    );
+}
+
+#[test]
+fn list_edits_take_the_first_entry_of_a_repeated_source() {
+    let (sway, daemon) = start(
+        "dup-edit",
+        &keyfile(
+            "[('xkb', 'us'), ('xkb', 'de'), ('xkb', 'us')]",
+            "per-window=true\n",
+        ),
+    );
+    sway.wait_for_layout(&["us", "de", "us"], 0);
+    // Window 1 on the second us, window 2 on de.
+    sway.window_event("focus", 1);
+    sway.user_switch(2);
+    wait_for_current(&daemon, "uint32 2");
+    sway.window_event("focus", 2);
+    sway.wait_for_layout(&["us", "de", "us"], 0);
+    sway.user_switch(1);
+    wait_for_current(&daemon, "uint32 1");
+    // de, current, follows to its new position; window 1's us goes to the
+    // first us, as in GNOME Shell.
+    daemon.gsettings_set(
+        SOURCES,
+        "sources",
+        "[('xkb', 'fr'), ('xkb', 'us'), ('xkb', 'de'), ('xkb', 'us')]",
+    );
+    sway.wait_for_layout(&["fr", "us", "de", "us"], 2);
+    wait_for_current(&daemon, "uint32 2");
+    sway.window_event("focus", 1);
+    sway.wait_for_layout(&["fr", "us", "de", "us"], 1);
+    wait_for_current(&daemon, "uint32 1");
+    // The current entry, a repeated source, also goes to its first entry.
+    sway.window_event("focus", 2);
+    sway.wait_for_layout(&["fr", "us", "de", "us"], 2);
+    sway.user_switch(3);
+    wait_for_current(&daemon, "uint32 3");
+    daemon.gsettings_set(
+        SOURCES,
+        "sources",
+        "[('xkb', 'de'), ('xkb', 'us'), ('xkb', 'us')]",
+    );
+    sway.wait_for_layout(&["de", "us", "us"], 1);
+    wait_for_current(&daemon, "uint32 1");
+    assert_stays(&sway, &["de", "us", "us"], 1);
+}
+
+#[test]
+fn per_window_sources_keep_their_entry_of_a_repeated_source() {
+    let (sway, daemon) = start(
+        "dup-per-window",
+        &keyfile(
+            "[('xkb', 'us'), ('xkb', 'de'), ('xkb', 'us')]",
+            "per-window=true\n",
+        ),
+    );
+    sway.wait_for_layout(&["us", "de", "us"], 0);
+    sway.window_event("focus", 1);
+    sway.user_switch(2);
+    wait_for_mru(&daemon, "[('xkb', 'us'), ('xkb', 'de')]");
+    // Window 2 never had an entry: the first one, the other us.
+    sway.window_event("focus", 2);
+    sway.wait_for_layout(&["us", "de", "us"], 0);
+    wait_for_current(&daemon, "uint32 0");
+    sway.window_event("focus", 1);
+    sway.wait_for_layout(&["us", "de", "us"], 2);
+    wait_for_current(&daemon, "uint32 2");
+    assert_stays(&sway, &["us", "de", "us"], 2);
+    // Focus changes alone don't write the history.
+    assert_eq!(
+        daemon.gsettings_get(SOURCES, "mru-sources"),
+        "[('xkb', 'us'), ('xkb', 'de')]"
+    );
+}
