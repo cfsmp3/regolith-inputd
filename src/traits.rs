@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
-use swayipc::{ClickMethod, Connection as SwayConnection, EnabledOrDisabled, SendEvents};
+use swayipc::{ClickMethod, EnabledOrDisabled, SendEvents};
 
-use crate::Message;
+use crate::{sway, Message};
 
 /// Pointer types whose acceleration profile the daemon has set.
 static ACCEL_PROFILE_SET: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -31,6 +31,15 @@ pub fn accel_profile_command(
         _ => return None,
     };
     Some(format!("input type:{pointer_type} accel_profile {profile}"))
+}
+
+/// Forget that the daemon set the acceleration profile of `pointer_type`:
+/// a new sway has the devices' own.
+pub fn forget_accel_profile(pointer_type: &str) {
+    ACCEL_PROFILE_SET
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(pointer_type);
 }
 
 /// Set `key` to `value` unless it has that value already, so that
@@ -62,9 +71,13 @@ pub fn set_enabled_if_changed(
 
 pub trait InputHandler {
     fn settings(&self) -> &Settings;
-    fn sway_connection(&mut self) -> &mut SwayConnection;
     fn apply_changes(&mut self, _: &str) -> Result<(), Box<dyn Error>>;
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>>;
+
+    /// Forget what the handler knows about the sway it applied settings to
+    /// so far (what it installed there, the defaults it saw): a new sway is
+    /// about to get every setting, as at a first launch.
+    fn reset(&mut self) {}
 
     /// The type of the sway input devices whose settings this handler
     /// mirrors back to GSettings, if any.
@@ -95,7 +108,7 @@ pub trait PointerMethods: InputHandler {
         let new_val: f64 = self.settings().get("speed");
         let pointer_type = self.pointer_type();
         let cmd = format!("input type:{pointer_type} pointer_accel {new_val}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn apply_accel_profile(&mut self) -> Result<(), Box<dyn Error>> {
@@ -112,7 +125,7 @@ pub trait PointerMethods: InputHandler {
         let already_set = set.contains(&pointer_type);
         if let Some(cmd) = accel_profile_command(&pointer_type, &profile, already_set) {
             info!("{cmd}");
-            self.sway_connection().run_command(cmd)?;
+            sway::run_command(cmd)?;
             set.insert(pointer_type);
         }
         Ok(())
@@ -125,7 +138,7 @@ pub trait PointerMethods: InputHandler {
         };
         let pointer_type = self.pointer_type();
         let cmd = format!("input type:{pointer_type} natural_scroll {new_val}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     /// Mirror the settings mice and touchpads share to GSettings.

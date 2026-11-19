@@ -1,19 +1,17 @@
 use crate::traits::{
-    set_enabled_if_changed, set_if_changed, InputHandler, PointerMethods, PrimitiveToSwayType,
-    SwayTypeToPrimitive,
+    forget_accel_profile, set_enabled_if_changed, set_if_changed, InputHandler, PointerMethods,
+    PrimitiveToSwayType, SwayTypeToPrimitive,
 };
-use crate::utils;
+use crate::{sway, utils};
 use gio::{prelude::SettingsExtManual, Settings};
 use log::info;
 
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::error::Error;
-use swayipc::Connection as SwayConnection;
 
 pub struct TouchpadHandler {
     settings: Settings,
-    sway_connection: SwayConnection,
     /// Click method of each touchpad, by identifier, before the daemon
     /// first set one; what GNOME's "default" restores.
     default_click_methods: BTreeMap<String, &'static str>,
@@ -22,10 +20,8 @@ pub struct TouchpadHandler {
 impl TouchpadHandler {
     pub fn new() -> TouchpadHandler {
         let settings = Settings::new("org.gnome.desktop.peripherals.touchpad");
-        let connection = SwayConnection::new().unwrap();
         TouchpadHandler {
             settings,
-            sway_connection: connection,
             default_click_methods: BTreeMap::new(),
             click_method_set: false,
         }
@@ -52,7 +48,7 @@ impl TouchpadHandler {
             .to_sway_type()
             .to_primitive();
         let cmd = format!("input type:touchpad tap {tap_enabled}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn apply_scroll_method(&mut self) -> Result<(), Box<dyn Error>> {
@@ -66,7 +62,7 @@ impl TouchpadHandler {
             "none"
         };
         let cmd = format!("input type:touchpad scroll_method {scroll_method}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn use_dwt(&mut self) -> Result<(), Box<dyn Error>> {
@@ -76,7 +72,7 @@ impl TouchpadHandler {
             .to_sway_type()
             .to_primitive();
         let cmd = format!("input type:touchpad dwt {dwt_enabled}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn send_events(&mut self) -> Result<(), Box<dyn Error>> {
@@ -85,7 +81,7 @@ impl TouchpadHandler {
         let new_val = new_val.replace('-', "_");
         let cmd = format!("input type:touchpad events {new_val}");
         info!("{cmd}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn use_drag(&mut self) -> Result<(), Box<dyn Error>> {
@@ -96,7 +92,7 @@ impl TouchpadHandler {
             .to_primitive();
         let cmd = format!("input type:touchpad drag {use_drag_enabled}");
         info!("{cmd}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
     fn use_drag_lock(&mut self) -> Result<(), Box<dyn Error>> {
@@ -107,7 +103,7 @@ impl TouchpadHandler {
             .to_primitive();
         let cmd = format!("input type:touchpad drag_lock {drag_lock_enabled}");
         info!("{cmd}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 
@@ -118,7 +114,7 @@ impl TouchpadHandler {
             .to_sway_type()
             .to_primitive();
         let cmd = format!("input type:touchpad middle_emulation {emulate_middle_enabled}");
-        self.sway_connection.run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 }
@@ -144,7 +140,7 @@ impl PointerMethods for TouchpadHandler {
         let pointer_type = self.pointer_type();
         let cmd = format!("input type:{pointer_type} left_handed {left_handed_enabled}");
         info!("{cmd}");
-        self.sway_connection().run_command(cmd)?;
+        sway::run_command(cmd)?;
         Ok(())
     }
 
@@ -159,7 +155,7 @@ impl PointerMethods for TouchpadHandler {
         self.click_method_set |= sway_click_method(&click_method).is_some();
         for cmd in commands {
             info!("{cmd}");
-            self.sway_connection().run_command(cmd)?;
+            sway::run_command(cmd)?;
         }
         Ok(())
     }
@@ -223,8 +219,12 @@ impl InputHandler for TouchpadHandler {
     fn settings(&self) -> &Settings {
         &self.settings
     }
-    fn sway_connection(&mut self) -> &mut swayipc::Connection {
-        &mut self.sway_connection
+    /// A new sway's touchpads have their own click methods, and none the
+    /// daemon set.
+    fn reset(&mut self) {
+        self.default_click_methods.clear();
+        self.click_method_set = false;
+        forget_accel_profile(self.pointer_type());
     }
     fn apply_all(&mut self) -> Result<(), Box<dyn Error>> {
         self.apply_speed()?;

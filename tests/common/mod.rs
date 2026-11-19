@@ -7,9 +7,11 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -61,6 +63,9 @@ pub struct FakeSway {
     commands: Arc<Mutex<Vec<String>>>,
     subscribed: Arc<Mutex<bool>>,
     state: Arc<Mutex<State>>,
+    socket: PathBuf,
+    /// Set once the fake sway has exited (see [`FakeSway::stop`]).
+    stopped: Arc<AtomicBool>,
 }
 
 struct State {
@@ -68,6 +73,12 @@ struct State {
     outputs: Value,
     /// Subscribed clients, with the events they subscribed to.
     subscribers: Vec<(UnixStream, Vec<String>)>,
+    /// Every connection a client made, to close when sway exits.
+    connections: Vec<UnixStream>,
+    /// How many connections are open: accepted, and their end not read.
+    open: usize,
+    /// Whether requests go unanswered, as with a sway that hangs.
+    silent: bool,
     /// How many times a client asked for the tree.
     tree_requests: usize,
     /// How many times a client asked for the outputs.
@@ -210,25 +221,91 @@ impl FakeSway {
         let listener = UnixListener::bind(socket).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let subscribed = Arc::new(Mutex::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(State {
             inputs: serde_json::from_str(inputs).unwrap(),
             outputs: serde_json::from_str(OUTPUTS).unwrap(),
             subscribers: Vec::new(),
+            connections: Vec::new(),
+            open: 0,
+            silent: false,
             tree_requests: 0,
             output_requests: 0,
         }));
         let (recorded, flag, shared) = (commands.clone(), subscribed.clone(), state.clone());
+        let exited = stopped.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                if exited.load(Ordering::SeqCst) {
+                    return;
+                }
+                {
+                    let mut state = shared.lock().unwrap();
+                    state.open += 1;
+                    if let Ok(registered) = stream.try_clone() {
+                        state.connections.push(registered);
+                    }
+                }
                 let (recorded, flag, shared) = (recorded.clone(), flag.clone(), shared.clone());
-                thread::spawn(move || serve(stream, recorded, flag, shared));
+                thread::spawn(move || {
+                    serve(stream, recorded, flag, shared.clone());
+                    shared.lock().unwrap().open -= 1;
+                });
             }
         });
         FakeSway {
             commands,
             subscribed,
             state,
+            socket: socket.to_path_buf(),
+            stopped,
         }
+    }
+
+    /// A fresh fake sway listening on `socket`, as a sway started (again) at
+    /// that path.
+    pub fn start_at(socket: &Path) -> FakeSway {
+        FakeSway::start(socket, INPUTS)
+    }
+
+    /// Exit, as sway does: every connection is closed and the socket goes
+    /// away.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        // Wake the listener up, so that it sees it has to stop.
+        let _ = UnixStream::connect(&self.socket);
+        let _ = fs::remove_file(&self.socket);
+        let mut state = self.state.lock().unwrap();
+        for stream in state.connections.drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        state.subscribers.clear();
+    }
+
+    /// Close the connections clients subscribed to events on, and only
+    /// those, as sway does with a subscriber it gives up on.
+    pub fn drop_subscribers(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (stream, _) in state.subscribers.drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Stop answering requests, or answer them again, as a sway that hangs
+    /// and recovers. Requests made in the meantime are never answered.
+    pub fn set_silent(&self, silent: bool) {
+        self.state.lock().unwrap().silent = silent;
+    }
+
+    /// How many connections clients have open to this sway: the ones whose
+    /// end has not been read yet.
+    pub fn open_connections(&self) -> usize {
+        self.state.lock().unwrap().open
+    }
+
+    /// How many clients are subscribed to events.
+    pub fn subscribers(&self) -> usize {
+        self.state.lock().unwrap().subscribers.len()
     }
 
     /// Send a tick event to the daemon, as `swaymsg -t send_tick` does. The
@@ -434,12 +511,17 @@ fn serve(
         let len = u32::from_ne_bytes(header[6..10].try_into().unwrap()) as usize;
         let kind = u32::from_ne_bytes(header[10..14].try_into().unwrap());
         let mut payload = vec![0u8; len];
-        stream.read_exact(&mut payload).unwrap();
+        if stream.read_exact(&mut payload).is_err() {
+            return;
+        }
         let payload = String::from_utf8(payload).unwrap();
         // Replies are written with the state locked, so that a client never
         // gets the events a command caused before the command's reply
         // (which is what a fence relies on).
         let mut state = state.lock().unwrap();
+        if state.silent {
+            continue;
+        }
         let reply = match kind {
             RUN_COMMAND => {
                 recorded.lock().unwrap().push(payload.clone());
@@ -580,6 +662,11 @@ impl Daemon {
         self.child.try_wait().unwrap().is_none()
     }
 
+    /// The daemon's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Write `keyfile` as the user's GSettings and start the daemon on a
     /// fresh fake sway.
     pub fn start(name: &str, keyfile: &str) -> (FakeSway, Daemon) {
@@ -592,22 +679,35 @@ impl Daemon {
         keyfile: &str,
         inputs: &'static str,
     ) -> (FakeSway, Daemon) {
-        Daemon::spawn(name, keyfile, inputs, None)
+        let (sway, daemon) = Daemon::spawn(name, keyfile, Some(inputs), None);
+        (sway.unwrap(), daemon)
     }
 
     /// Like `start`, in a Wayland session with stand-in IBus programs in
     /// `PATH` and a private bus for them, so that the session's own IBus,
     /// if any, is left alone.
     pub fn start_with_ibus(name: &str, keyfile: &str, ibus: Ibus) -> (FakeSway, Daemon) {
-        Daemon::spawn(name, keyfile, INPUTS, Some(ibus))
+        let (sway, daemon) = Daemon::spawn(name, keyfile, Some(INPUTS), Some(ibus));
+        (sway.unwrap(), daemon)
+    }
+
+    /// Like `start`, with no sway listening yet at the daemon's `SWAYSOCK`
+    /// (see [`Daemon::socket`]).
+    pub fn start_without_sway(name: &str, keyfile: &str) -> Daemon {
+        Daemon::spawn(name, keyfile, None, None).1
+    }
+
+    /// The socket the daemon's `SWAYSOCK` names.
+    pub fn socket(&self) -> PathBuf {
+        self.dir.join("sway.sock")
     }
 
     fn spawn(
         name: &str,
         keyfile: &str,
-        inputs: &'static str,
+        inputs: Option<&'static str>,
         ibus: Option<Ibus>,
-    ) -> (FakeSway, Daemon) {
+    ) -> (Option<FakeSway>, Daemon) {
         let dir = std::env::temp_dir().join(format!("inputd-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let settings_dir = dir.join("config/glib-2.0/settings");
@@ -615,7 +715,7 @@ impl Daemon {
         fs::write(settings_dir.join("keyfile"), keyfile).unwrap();
 
         let socket = dir.join("sway.sock");
-        let sway = FakeSway::start(&socket, inputs);
+        let sway = inputs.map(|inputs| FakeSway::start(&socket, inputs));
         let mut command = Command::new(env!("CARGO_BIN_EXE_regolith-inputd"));
         command
             .env("SWAYSOCK", &socket)
@@ -627,9 +727,13 @@ impl Daemon {
         let trawl_calls = Arc::new(Mutex::new(Vec::new()));
         let bus = match ibus {
             // Without a Wayland display the daemon starts no input method, so
-            // tests run from a desktop session leave its IBus alone.
+            // tests run from a desktop session leave its IBus alone. Without
+            // a session bus it can't learn the session's own sway from the
+            // user manager, and leaves that sway alone too.
             None => {
-                command.env_remove("WAYLAND_DISPLAY");
+                command
+                    .env_remove("WAYLAND_DISPLAY")
+                    .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent");
                 None
             }
             Some(ibus) => Some(fake_ibus(&dir, name, ibus, &trawl_calls, &mut command)),
